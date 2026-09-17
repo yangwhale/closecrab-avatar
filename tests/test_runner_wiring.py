@@ -133,3 +133,18 @@ def test_dit_ranks_do_not_register():
         and n.lineno < min(c.lineno for c in _calls("Worker"))]
     assert returns_before_worker, \
         "main() 里没有「DiT rank 提前返回」那条路 —— 5 个 rank 都会去注册"
+
+
+def test_process_group_timeout_is_not_the_default():
+    """⭐ NCCL watchdog 默认 10 分钟，会把「空闲阻塞省电」那条设计打死。
+
+    实测：最后一次说话之后整十分钟，五个进程一起 SIGABRT ——
+      Watchdog caught collective operation timeout: WorkNCCL(OpType=RECV)
+      ran for 600087 ms before timing out
+
+    现象是「worker 好好的突然不在册了」，原因藏在日志最底下一大段 C++ 栈里。
+    这条守住那个显式 timeout 别在重构里蒸发。
+    """
+    src = _src()
+    assert "timeout=" in src and "timedelta" in src, \
+        "init_process_group 没有显式 timeout —— 空闲 10 分钟后整组会被 NCCL 打掉"

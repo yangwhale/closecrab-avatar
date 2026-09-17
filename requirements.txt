@@ -11,4 +11,5 @@ livekit-api>=0.8          # 只用 AccessToken 铸票
 # numpy, pillow
 
 # 冒烟测试用（scripts/install.sh 不装，只有跑 smoke.py 时才需要）
+pillow>=10.0          # 只为量参考图的宽高；没有它也能跑，宽高显示 0
 httpx>=0.27

@@ -218,13 +218,31 @@ def _init_distributed() -> tuple[int, int]:
     只是 `dist.is_initialized()` 为 False，于是判定「没模型」安静退回静帧。
     **兜底越体面，漏越难发现。**
     """
+    import datetime
+
     import torch
     import torch.distributed as dist
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # ⭐ **超时必须放到很长，默认 10 分钟会把我们打死。**
+        #
+        # 这条设计是「没人说话时整组停在 dist.recv 上省电」（见
+        # pipeline_source 文件头）。但 NCCL 的 watchdog 不知道那是故意的 ——
+        # 它只看到一个 RECV 挂了 600 秒，判定集合通信挂死，**SIGABRT 掉整组**：
+        #
+        #   Watchdog caught collective operation timeout:
+        #   WorkNCCL(OpType=RECV) ran for 600087 ms before timing out
+        #
+        # 实测就是这么死的：最后一次说话之后整十分钟，五个进程一起没。
+        # 现象是「worker 好好的突然就不在册了」，而日志要翻到最底下
+        # 那一大段 C++ 栈才看得到原因。
+        #
+        # 代价说清楚：真挂死的时候也要等这么久才报。这条路径上「挂死」
+        # 本来就靠控制面的心跳超时发现（30 秒），不靠 NCCL。
+        dist.init_process_group(backend="nccl", init_method="env://",
+                                timeout=datetime.timedelta(hours=12))
     return dist.get_rank(), dist.get_world_size()
 
 
