@@ -4,7 +4,19 @@
 不需要对外开端口，可以在 NAT / 不同 VPC 后面，Spot 被回收后
 换台机器重新注册就行。控制面只记账，从不主动连 worker。
 
-一张卡一个 worker 进程，模型常驻 —— 这样每路会话不用付启动成本。
+## 五卡流式下这个进程长什么样
+
+`torchrun --nproc_per_node=5` 起 5 个**本文件**的进程，它们分两种角色：
+
+    rank 0–3   DiT。`load()` 之后就在主线程里把 `generate()` 跑到底，
+               **完全不碰控制面、不碰 LiveKit**。它们只是算力。
+    rank 4     VAE。模型跑在后台线程，主线程跑下面这个 asyncio Worker。
+
+所以「一个 worker」在控制面眼里是**一个** worker（rank 4 注册的那个），
+底下吃 5 张卡。不要让 5 个 rank 都去注册 —— 那会凭空多出 4 个幽灵 worker，
+控制面按它们的容量派活，派过去没人接。
+
+单卡 / 无模型时 `WORLD_SIZE=1`，走静帧兜底，形态跟以前一样。
 """
 from __future__ import annotations
 
@@ -22,9 +34,9 @@ from livekit.agents.voice.avatar import AvatarOptions, AvatarRunner, DataStreamA
 
 from .generators import StaticImageGenerator
 
-# ⚠️ **不在顶层 import pipeline_source 之外的任何重依赖。**
-#    这个文件在控制面机器上也可能被 import（跑测试、查签名），
-#    而那台没有 torch。`pipeline_source` 顶层也只有 numpy。
+# ⚠️ **顶层不 import torch，也不 import 任何拖 torch 的东西。**
+#    这个文件在控制面机器上也会被 import（跑测试、查签名），而那台没有 torch。
+#    `live_generator` 只要 livekit + numpy，`pipeline_source` 顶层只要 numpy。
 from .live_generator import LiveAvatarGenerator
 from .pipeline_source import LiveAvatarPipelineSource
 
@@ -47,43 +59,20 @@ def _load_image(path: str | None, size: tuple[int, int]) -> np.ndarray:
 
 
 class Worker:
+    """控制面那一侧。**对模型只知道一件事：有没有 `source`。**
+
+    `source` 是已经 `load()` 过、正在跑的 `FrameSource`；`None` 表示这台
+    没有可用模型，退回静帧。判定在 `main()` 里做完，这里不再猜。
+    """
+
     def __init__(self, gateway_url: str, worker_id: str, *, capacity: int = 1,
-                 image_path: str | None = None,
-                 ckpt_dir: str = "", training_config: str = ""):
+                 image_path: str | None = None, source=None):
         self._gw = gateway_url.rstrip("/")
         self._id = worker_id
         self._capacity = capacity
         self._image_path = image_path
-        self._ckpt_dir = ckpt_dir
-        self._training_config = training_config
+        self._source = source
         self._active: set[str] = set()
-        self._model_ready = self._detect_model()
-
-    def _detect_model(self) -> bool:
-        """有没有真模型可用。**判据是「能不能跑」，不是「装没装」。**
-
-        三个条件缺一不可，而且缺任何一个的症状都是「画面是张不动的图」——
-        所以这里逐条查、逐条说，别笼统报一句「模型不可用」。
-        """
-        import os.path
-
-        if not self._ckpt_dir or not os.path.isdir(self._ckpt_dir):
-            log.warning("没有权重目录（%s）→ 退回静帧", self._ckpt_dir or "未指定")
-            return False
-        try:
-            import torch.distributed as dist
-        except Exception:
-            log.warning("没装 torch → 退回静帧")
-            return False
-        if not dist.is_available() or not dist.is_initialized():
-            # 五卡流式必须在 torchrun 下跑。**这是最常见的一种「没生效」**：
-            # 直接 `python -m worker.runner` 起来一切正常，就是画面不动。
-            log.warning("不在 torchrun 下（dist 未初始化）→ 退回静帧。"
-                        "五卡流式见 docs/deploy.md「五卡流式怎么起」")
-            return False
-        log.info("真模型可用：rank %d/%d，权重 %s",
-                 dist.get_rank(), dist.get_world_size(), self._ckpt_dir)
-        return True
 
     async def run(self) -> None:
         async with aiohttp.ClientSession() as http:
@@ -102,12 +91,14 @@ class Worker:
                     await asyncio.sleep(RECONNECT_BACKOFF_S)
 
     async def _register(self, http: aiohttp.ClientSession) -> None:
-        meta = {"host": socket.gethostname(), "pid": os.getpid()}
+        meta = {"host": socket.gethostname(), "pid": os.getpid(),
+                "model": bool(self._source)}
         async with http.post(f"{self._gw}/internal/workers/register",
                              json={"worker_id": self._id, "capacity": self._capacity,
                                    "meta": meta}) as r:
             r.raise_for_status()
-        log.info("已注册到控制面：%s（容量 %d）", self._gw, self._capacity)
+        log.info("已注册到控制面：%s（容量 %d，%s）", self._gw, self._capacity,
+                 "真模型" if self._source else "静帧兜底")
 
     async def _heartbeat_loop(self, http: aiohttp.ClientSession) -> None:
         while True:
@@ -141,33 +132,30 @@ class Worker:
             await room.connect(job["livekit_url"], job["room_token"])
             log.info("会话 %s 已进房 %s", psid, job["room_name"])
 
-            w, h = (int(x) for x in job.get("size", "384*256").split("*"))
-
-            # 有模型就用真的，没有就退回静帧 —— **退回要说出来**，
-            # 否则「怎么是张不动的图」得查半天。
-            if self._model_ready:
-                src = LiveAvatarPipelineSource(
-                    ref_image_path=job.get("image_path") or self._image_path,
-                    prompt=job.get("prompt", ""),
-                    ckpt_dir=self._ckpt_dir,
-                    training_config=self._training_config,
-                    size=f"{w}*{h}",
-                    infer_frames=int(job.get("infer_frames", 48)),
-                )
-                gen = LiveAvatarGenerator(src)
-                log.info("会话 %s 用真模型", psid)
+            if self._source is not None:
+                # ⚠️ 尺寸**取模型的真实出帧尺寸**，不取 job 里请求的那个。
+                #    模型按 64 的网格取整（请求 720×400 实出 704×384），
+                #    `AvatarOptions` 配错了帧尺寸对不上。
+                w, h = self._source.size
+                gen = LiveAvatarGenerator(self._source)
+                fps = self._source.geometry.fps
+                # 上一场可能留下半句话没念完的 PCM —— 新会话从干净状态开始。
+                self._source.reset()
+                log.info("会话 %s 用真模型（%d×%d @ %d fps）", psid, w, h, fps)
             else:
+                w, h = (int(x) for x in job.get("size", "384*256").split("*"))
+                fps = 25
                 img = _load_image(job.get("image_path") or self._image_path, (w, h))
-                gen = StaticImageGenerator(img, fps=25)
-                log.warning("会话 %s **退回静帧**（没检测到模型，"
-                            "看 --ckpt-dir 和 torchrun 起没起）", psid)
+                gen = StaticImageGenerator(img, fps=fps)
+                log.warning("会话 %s **退回静帧** —— 这台没有可用模型，"
+                            "起动时的 warning 里写了是哪一条不满足", psid)
 
             runner = AvatarRunner(
                 room,
                 audio_recv=DataStreamAudioReceiver(room, sender_identity=job["agent_identity"]),
                 video_gen=gen,
                 options=AvatarOptions(
-                    video_width=w, video_height=h, video_fps=25,
+                    video_width=w, video_height=h, video_fps=fps,
                     audio_sample_rate=job.get("sample_rate", 16000), audio_channels=1,
                 ),
             )
@@ -180,6 +168,9 @@ class Worker:
             log.exception("会话 %s 异常结束", psid)
         finally:
             self._active.discard(psid)
+            if self._source is not None:
+                # 人走了，别让没念完的音频喂给下一场
+                self._source.reset()
             try:
                 await room.disconnect()
             except Exception:
@@ -192,6 +183,49 @@ class Worker:
             log.info("会话 %s 收尾完成", psid)
 
 
+# ── 启动 ──────────────────────────────────────────────────────────
+
+
+def _init_distributed() -> tuple[int, int]:
+    """torchrun 只设环境变量，进程组得自己建。
+
+    ⚠️ 这一步漏了的症状极难查：注册、心跳、建会话、出帧一路全绿，
+    只是 `dist.is_initialized()` 为 False，于是判定「没模型」安静退回静帧。
+    **兜底越体面，漏越难发现。**
+    """
+    import torch
+    import torch.distributed as dist
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    return dist.get_rank(), dist.get_world_size()
+
+
+def _why_no_model(a) -> str | None:
+    """不能用真模型的话，说清楚是**哪一条**不满足。
+
+    三个条件缺一不可，而缺任何一个的症状都是「画面是张不动的图」——
+    所以逐条查、逐条说，别笼统报一句「模型不可用」。
+    """
+    if int(os.environ.get("WORLD_SIZE", "1")) < 5:
+        return ("不在 torchrun 下或卡数不足（WORLD_SIZE=%s，五卡流式要 5）。"
+                "起法见 docs/deploy.md「五卡流式怎么起」"
+                % os.environ.get("WORLD_SIZE", "未设"))
+    for label, path in (("权重目录", a.ckpt_dir), ("训练配置", a.training_config),
+                        ("参考图", a.image), ("预热音频", a.warmup_audio)):
+        if not path:
+            return f"没指定{label}"
+        if not os.path.exists(path):
+            return f"{label}不存在：{path}"
+    try:
+        import torch  # noqa: F401
+    except Exception as e:
+        return f"torch import 不了：{e}"
+    return None
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -200,19 +234,58 @@ def main() -> int:
     ap.add_argument("--worker-id", default=os.environ.get(
         "LA_WORKER_ID", f"{socket.gethostname()}-{os.environ.get('CUDA_VISIBLE_DEVICES','0')}"))
     ap.add_argument("--capacity", type=int, default=int(os.environ.get("LA_WORKER_CAPACITY", "1")))
-    ap.add_argument("--image", default=os.environ.get("LA_AVATAR_IMAGE"))
+    ap.add_argument("--image", default=os.environ.get(
+        "LA_AVATAR_IMAGE", os.path.expanduser("~/LiveAvatar/examples/dwarven_blacksmith.jpg")))
+    ap.add_argument("--prompt", default=os.environ.get("LA_AVATAR_PROMPT", ""))
     ap.add_argument("--ckpt-dir", default=os.environ.get(
         "LA_CKPT_DIR", os.path.expanduser("~/LiveAvatar/ckpt/Wan2.2-S2V-14B")))
     ap.add_argument("--training-config", default=os.environ.get(
         "LA_TRAINING_CONFIG",
         os.path.expanduser("~/LiveAvatar/liveavatar/configs/s2v_causal_sft.yaml")))
+    # 第 0、1 轮预热用的音频，内容无所谓 —— 只用来建编码模板。见 pipeline_source。
+    ap.add_argument("--warmup-audio", default=os.environ.get(
+        "LA_WARMUP_AUDIO",
+        os.path.expanduser("~/LiveAvatar/examples/dwarven_blacksmith.wav")))
+    ap.add_argument("--size", default=os.environ.get("LA_SIZE", "720*400"))
+    ap.add_argument("--infer-frames", type=int, default=int(os.environ.get("LA_INFER_FRAMES", "48")))
+    ap.add_argument("--num-gpus-dit", type=int, default=4)
     a = ap.parse_args()
+
+    reason = _why_no_model(a)
+    source = None
+    rank = 0
+    if reason:
+        log.warning("**退回静帧**：%s", reason)
+    else:
+        rank, world = _init_distributed()
+        source = LiveAvatarPipelineSource(
+            ref_image_path=a.image, prompt=a.prompt,
+            ckpt_dir=a.ckpt_dir, training_config=a.training_config,
+            warmup_audio=a.warmup_audio, size=a.size,
+            infer_frames=a.infer_frames, num_gpus_dit=a.num_gpus_dit,
+        )
+        # 开机就装，不拖到第一句话 —— 否则第一个用户等三分钟。
+        source.load()
+
+        if rank < a.num_gpus_dit:
+            # DiT rank：主线程直接把 generate() 跑到底，不注册、不进房间。
+            log.info("rank %d 是 DiT，只出算力", rank)
+            try:
+                source.run_blocking()
+            except KeyboardInterrupt:
+                return 130
+            return 0
+
+        source.start()                 # VAE rank：模型进后台线程
+
     try:
         asyncio.run(Worker(a.gateway, a.worker_id, capacity=a.capacity,
-                           image_path=a.image, ckpt_dir=a.ckpt_dir,
-                           training_config=a.training_config).run())
+                           image_path=a.image, source=source).run())
     except KeyboardInterrupt:
         return 130
+    finally:
+        if source is not None:
+            source.stop()
     return 0
 
 

@@ -1,7 +1,7 @@
 """编排层 —— 用假模型，不碰 GPU。
 
-这一层只做三件事：攒 PCM、模型来要时给**恰好一块**、把帧发出去。
-所以测试也只盯这三件，外加最要命的打断。
+这一层现在薄得只剩接线：音频转发 ＋ 塞 inbox、出帧、打断。
+缓冲本身的行为在 `test_pcm_inbox.py`，不在这里重复。
 """
 import asyncio
 
@@ -10,39 +10,43 @@ import pytest
 from livekit import rtc
 from livekit.agents.voice.avatar import AudioSegmentEnd
 
-from worker.audio_stream import BlockGeometry
+from worker.audio_stream import BlockGeometry, PcmInbox
 from worker.live_generator import LiveAvatarGenerator, to_video_frame
 
 G = BlockGeometry()
 
 
 class FakeSource:
-    """假模型。记下回调、按需拉块、记 reset 次数。"""
+    """假模型。真 inbox（就那一个类，没必要再假一个），帧靠手工塞。"""
 
     def __init__(self, *, w=64, h=48):
         self.w, self.h = w, h
-        self.cb = None
-        self.out = None
+        self._inbox = PcmInbox(G)
+        self._frames: list[np.ndarray] = []
         self.resets = 0
-        self.starts = 0
 
     @property
     def size(self):
         return (self.w, self.h)
 
-    def start(self, audio_cb, out):
-        self.starts += 1
-        self.cb, self.out = audio_cb, out
+    @property
+    def geometry(self):
+        return G
+
+    @property
+    def inbox(self):
+        return self._inbox
+
+    def next_frame(self):
+        return self._frames.pop(0) if self._frames else None
 
     def reset(self):
         self.resets += 1
+        self._inbox.clear()
+        self._frames.clear()
 
-    def tick(self):
-        """模拟模型拉一块并吐一帧。"""
-        chunk = self.cb()
-        self.out.put_nowait(to_video_frame(
-            np.zeros((self.h, self.w, 4), dtype=np.uint8)))
-        return chunk
+    def emit(self):
+        self._frames.append(np.zeros((self.h, self.w, 4), dtype=np.uint8))
 
 
 def pcm_frame(seconds: float, value: int = 1000) -> rtc.AudioFrame:
@@ -54,7 +58,7 @@ def pcm_frame(seconds: float, value: int = 1000) -> rtc.AudioFrame:
 
 def make():
     src = FakeSource()
-    return src, LiveAvatarGenerator(src, geom=G)
+    return src, LiveAvatarGenerator(src)
 
 
 async def drain(gen, n, timeout=2.0):
@@ -84,6 +88,14 @@ async def test_audio_passes_through_immediately():
 
 
 @pytest.mark.asyncio
+async def test_pushed_audio_reaches_the_model():
+    """推进来的 PCM 必须进 inbox —— 漏了的症状是「有声音但嘴不动」。"""
+    src, gen = make()
+    await gen.push_audio(pcm_frame(0.1))
+    assert src.inbox.pending_samples == int(G.sample_rate * 0.1)
+
+
+@pytest.mark.asyncio
 async def test_segment_end_does_not_clear_the_buffer():
     """⭐ 段落结束**不能清缓冲** —— 剩下那点不足一块的音频还要说完。
 
@@ -93,74 +105,19 @@ async def test_segment_end_does_not_clear_the_buffer():
     src, gen = make()
     await gen.push_audio(pcm_frame(0.1, value=1000))     # 远不足一块
     await gen.push_audio(AudioSegmentEnd())
-    chunk = src.cb()
-    assert len(chunk) == G.block_samples
-    assert np.count_nonzero(chunk) > 0, "段落结束把没说完的音频清掉了"
+    assert src.inbox.pending_samples > 0, "段落结束把没说完的音频清掉了"
+    assert src.resets == 0, "段落结束不该通知模型丢状态"
 
 
-# ── 模型来拉音频：长度恒定 + 静音兜底 ──────────────────────────────
-
-@pytest.mark.asyncio
-async def test_block_length_is_always_exact():
-    """⭐ 无论缓冲里有多少，返回长度**恒为** block_samples。
-
-    长度不固定的话模型侧编码窗口会错位 —— 不报错，只是口型跟声音差一截。
-    """
-    src, gen = make()
-    await gen.push_audio(pcm_frame(0.01))           # 远不足
-    assert len(src.cb()) == G.block_samples
-    await gen.push_audio(pcm_frame(5.0))            # 远超
-    for _ in range(5):
-        assert len(src.cb()) == G.block_samples
-
+# ── 出帧 ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_silence_when_empty():
-    """没货给静音 —— 对应「人在那儿但没说话」，不是错误状态。"""
+async def test_frames_are_emitted_as_video_frames():
     src, gen = make()
-    await gen.push_audio(pcm_frame(0.01))
-    src.cb()                                        # 把那点货吃掉
-    assert not np.any(src.cb()), "缓冲空了却没给静音"
-
-
-@pytest.mark.asyncio
-async def test_int16_is_scaled_to_unit_float():
-    """⭐ int16 必须转成 [-1,1] 的 float32。
-
-    少这一步 wav2vec 的 processor 会把整数当振幅，特征完全不对 ——
-    而它照样出视频，只是口型对不上。
-    """
-    src, gen = make()
-    await gen.push_audio(pcm_frame(1.0, value=32767))
-    chunk = src.cb()
-    assert chunk.dtype == np.float32
-    assert 0.9 < chunk.max() <= 1.0, f"没归一化：max={chunk.max()}"
-
-
-@pytest.mark.asyncio
-async def test_pcm_is_consumed_in_order_without_gaps():
-    """跨多个 AudioFrame 拼接时不能丢样本、不能重复。"""
-    src, gen = make()
-    await gen.push_audio(pcm_frame(0.3, value=100))      # 4800
-    await gen.push_audio(pcm_frame(0.3, value=200))      # 4800，合计 9600
-    first = src.cb()
-    assert np.count_nonzero(first) == G.block_samples, "第一块就出现空洞"
-    second = src.cb()
-    assert np.count_nonzero(second) == 9600 - G.block_samples, \
-        f"第二块真样本数不对：{np.count_nonzero(second)}"
-
-
-# ── 模型什么时候启动 ──────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_model_starts_only_on_first_audio():
-    """⭐ 没人说话就不启动模型 —— 不说话不占卡。"""
-    src, gen = make()
-    assert src.starts == 0
-    await gen.push_audio(pcm_frame(0.1))
-    assert src.starts == 1
-    await gen.push_audio(pcm_frame(0.1))
-    assert src.starts == 1, "重复启动了"
+    src.emit()
+    got = await drain(gen, 1, timeout=1.0)
+    assert got and isinstance(got[0], rtc.VideoFrame)
+    assert (got[0].width, got[0].height) == src.size
 
 
 # ── ⭐ 打断 ───────────────────────────────────────────────────────
@@ -169,14 +126,13 @@ async def test_model_starts_only_on_first_audio():
 async def test_clear_buffer_drops_everything():
     src, gen = make()
     await gen.push_audio(pcm_frame(3.0))
-    src.tick()                                      # 队列里放一帧
-    assert not gen._out.empty()
+    src.emit()
 
     gen.clear_buffer()
-    assert gen._out.empty(), "帧队列没清"
     assert gen._audio_out.empty(), "音频队列没清"
     assert src.resets == 1, "没通知模型丢在途状态"
-    assert not np.any(src.cb()), "PCM 缓冲没清 —— 打断后还在念上一句"
+    assert src.inbox.pending_samples == 0, "PCM 没清 —— 打断后还在念上一句"
+    assert src.next_frame() is None, "已生成的帧没丢 —— 打断后嘴还在动"
 
 
 @pytest.mark.asyncio
@@ -185,7 +141,7 @@ async def test_can_speak_again_after_interrupt():
     await gen.push_audio(pcm_frame(3.0))
     gen.clear_buffer()
     await gen.push_audio(pcm_frame(3.0, value=500))
-    assert np.count_nonzero(src.cb()) == G.block_samples, "打断之后新的话进不来"
+    assert src.inbox.pending_samples > 0, "打断之后新的话进不来"
 
 
 # ── 帧格式 ────────────────────────────────────────────────────────
@@ -199,5 +155,6 @@ def test_frame_conversion_keeps_dimensions():
 
 
 def test_size_comes_from_the_model():
+    """⭐ 尺寸取模型真实出帧尺寸，不取请求值 —— 模型按 64 的网格取整。"""
     src, gen = make()
     assert gen.size == src.size
