@@ -26,7 +26,7 @@ from .lk_token import mint_worker_token
 from .scheduler import NoCapacity, Scheduler
 from .store import Session, Store
 
-log = logging.getLogger("liveavatar.gateway")
+log = logging.getLogger("closecrab.avatar")
 
 REAP_INTERVAL_S = 10.0
 LONGPOLL_TIMEOUT_S = 25.0

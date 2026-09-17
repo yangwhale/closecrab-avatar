@@ -6,8 +6,8 @@
 """
 import pytest
 
-from liveavatar_gateway.auth import ApiKey
-from liveavatar_gateway.entry import ENV_KEYS, load_keyring
+from closecrab_avatar.auth import ApiKey
+from closecrab_avatar.entry import ENV_KEYS, load_keyring
 
 
 def test_parses_a_normal_ring():

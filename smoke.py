@@ -14,9 +14,9 @@ os.environ.setdefault("LA_GATEWAY_DB", ":memory:")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from liveavatar_gateway.app import create_app  # noqa: E402
-from liveavatar_gateway.auth import ApiKey, KeyRing, sign_client_token  # noqa: E402
-from liveavatar_gateway.config import Settings  # noqa: E402
+from closecrab_avatar.app import create_app  # noqa: E402
+from closecrab_avatar.auth import ApiKey, KeyRing, sign_client_token  # noqa: E402
+from closecrab_avatar.config import Settings  # noqa: E402
 
 KEY = ApiKey(key_id="demo", secret="s" * 32, max_concurrency=8)
 app = create_app(Settings.from_env(), KeyRing({"demo": KEY}))

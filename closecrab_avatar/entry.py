@@ -72,7 +72,7 @@ def load_keyring(raw: str | None = None) -> KeyRing:
 
 
 def build() -> FastAPI:
-    """`uvicorn --factory liveavatar_gateway.entry:build`"""
+    """`uvicorn --factory closecrab_avatar.entry:build`"""
     _configure_logging()
     return create_app(Settings.from_env(), load_keyring())
 

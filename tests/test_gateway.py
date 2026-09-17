@@ -8,12 +8,12 @@ import time
 
 import pytest
 
-from liveavatar_gateway.auth import (
+from closecrab_avatar.auth import (
     ApiKey, AuthError, KeyRing, make_terminate_token, sign_client_token,
     verify_bearer, verify_terminate_token,
 )
-from liveavatar_gateway.scheduler import NoCapacity, Scheduler
-from liveavatar_gateway.store import Session, Store
+from closecrab_avatar.scheduler import NoCapacity, Scheduler
+from closecrab_avatar.store import Session, Store
 
 KEY = ApiKey(key_id="k1", secret="s" * 32, max_concurrency=2, label="test")
 OTHER = ApiKey(key_id="k2", secret="t" * 32)
@@ -181,8 +181,8 @@ def test_sweeps_an_idle_worker_that_died(tmp_path):
     `live_workers()`，槽位数**会**正确地掉下去，看起来一切正常。
     """
     import time as _t
-    from liveavatar_gateway.scheduler import Scheduler
-    from liveavatar_gateway.store import Store
+    from closecrab_avatar.scheduler import Scheduler
+    from closecrab_avatar.store import Store
 
     store = Store(str(tmp_path / "s.db"))
     sched = Scheduler(store, heartbeat_timeout_s=0.05)
@@ -200,8 +200,8 @@ def test_sweeps_an_idle_worker_that_died(tmp_path):
 def test_still_sweeps_a_busy_worker(tmp_path):
     """原来那条路径不能修坏：有会话的 worker 照样要摘，会话置 closed 不删。"""
     import time as _t
-    from liveavatar_gateway.scheduler import Scheduler
-    from liveavatar_gateway.store import Store
+    from closecrab_avatar.scheduler import Scheduler
+    from closecrab_avatar.store import Store
 
     store = Store(str(tmp_path / "s.db"))
     sched = Scheduler(store, heartbeat_timeout_s=0.05)

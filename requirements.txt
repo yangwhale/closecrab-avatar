@@ -9,3 +9,6 @@ livekit-api>=0.8          # 只用 AccessToken 铸票
 # livekit-agents>=1.5
 # livekit>=0.17
 # numpy, pillow
+
+# 冒烟测试用（scripts/install.sh 不装，只有跑 smoke.py 时才需要）
+httpx>=0.27

@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 import json
 
-from liveavatar_gateway.lk_token import mint_worker_token
+from closecrab_avatar.lk_token import mint_worker_token
 
 
 def _payload(tok: str) -> dict:
