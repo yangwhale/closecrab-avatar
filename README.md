@@ -1,11 +1,28 @@
 # LiveAvatar Gateway
 
-把 LiveAvatar 包装成 **LiveKit 眼里的第 9 家数字人供应商** —— agent 侧用标准
-`AvatarSession(...)` 调用，跟接 HeyGen / Tavus 写法完全一样，复杂度全在网关里面。
+**音频进，视频流出。复杂度全包在里面。**
+
+```
+agent 侧只写这一句 —— 跟接 HeyGen / Tavus 完全一样
+    AvatarSession("liveavatar/<形象>", base_url=..., api_key=..., api_secret=...)
+       ↓  音频
+    ┌──────────────────────────────────┐
+    │  网关：鉴权 调度 铸票 回收 生成      │   ← 这一整块是我们的
+    └──────────────────────────────────┘
+       ↓  视频 + 原音频（LiveKit 房间里的一路 participant）
+```
+
+调用方**不需要知道**：模型在哪张卡上、卡够不够、Spot 被回收了怎么办、
+token 怎么铸、会话怎么回收、音频怎么切块喂给模型。
+它只知道一件事：**给我一个形象和一路音频，房间里会出现一个会说话的人。**
 
 > **契约来源**：`livekit/agents/inference/avatar.py`（HTTP 形状、token 铸造语义、
 > `terminate_token` 用途）、`voice/avatar/_datastream_io.py`（房间内数据面、RPC 名、topic）、
 > `voice/avatar/_types.py`（`VideoGenerator` 三方法）。**逐条读源码核实，非推测。**
+
+> **GPU 机器怎么装、为什么是这几个版本** →
+> [gpu-tpu-pedia / LiveAvatar / RUNBOOK.md](https://github.com/yangwhale/gpu-tpu-pedia/blob/main/gpu/inference/LiveAvatar/RUNBOOK.md)
+> （照抄就通；踩过的坑都在那份的第 0 节）
 
 ## 现状
 
