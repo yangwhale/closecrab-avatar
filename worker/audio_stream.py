@@ -167,6 +167,40 @@ class BucketGeometry:
 
 
 
+def gather_slots(embed, repeat: int, geom: BucketGeometry):
+    """取第 `repeat` 轮要喂给模型的那 `infer_frames` 个槽位。
+
+    `embed` 形状 `(..., T, D)`，T 是已经到的嵌入帧数。返回 `(..., infer_frames, D)`。
+
+    ## ⚠️ 超出已有长度的槽位要**填零**，不是裁剪也不是报错
+
+    上游 `audio_encoder.py:209-212` 的 else 分支就是填零：
+
+        if bi < audio_frame_num:  取第 bi 帧
+        else:                     torch.zeros(...)
+
+    这一半很容易漏 —— 我第一版只实现了「什么时候能开一轮」，
+    直接拿索引去取，冲句尾那一轮立刻 `IndexError`。
+    两者是同一个契约的两半：**什么时候能渲** 和 **超出的部分喂什么**。
+
+    **不能改成裁剪到最后一帧**：那样句尾会把最后一个音素拖长成半秒，
+    嘴型定格在那儿不动 —— 比填零（闭嘴）难看得多，而且不报错。
+    """
+    import numpy as _np
+
+    have = embed.shape[-2]
+    lo = repeat * geom.infer_frames
+    idx = [geom.slot_frame(i) for i in range(lo, lo + geom.infer_frames)]
+
+    out = _np.zeros(embed.shape[:-2] + (geom.infer_frames, embed.shape[-1]),
+                    dtype=embed.dtype)
+    for k, bi in enumerate(idx):
+        if bi < have:
+            out[..., k, :] = embed[..., bi, :]
+        # else: 保持零 —— 上游语义
+    return out
+
+
 def seconds_to_embed_frames(seconds: float, geom: BucketGeometry) -> int:
     """秒 → 音频嵌入帧数。
 

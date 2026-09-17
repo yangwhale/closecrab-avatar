@@ -229,3 +229,53 @@ def test_seconds_conversion_uses_embed_rate_not_pcm_rate():
     """
     assert seconds_to_embed_frames(1.0, G) == 30
     assert seconds_to_embed_frames(5.0, G) == 150      # 正好一轮
+
+
+# ── 取槽位：超出已有音频的部分要填零 ──────────────────────────────
+
+def _embed(n, dim=4):
+    """(1, n, dim)，第 i 帧全是 i+1，方便看取到了哪一帧。"""
+    a = np.zeros((1, n, dim), dtype=np.float32)
+    for i in range(n):
+        a[0, i, :] = i + 1
+    return a
+
+
+def test_gather_takes_the_right_frames():
+    from worker.audio_stream import gather_slots
+    out = gather_slots(_embed(300), 0, G)
+    assert out.shape == (1, G.infer_frames, 4)
+    # 第 0 个槽位取第 0 帧（值 1），第 79 个取第 148 帧（值 149）
+    assert out[0, 0, 0] == 1
+    assert out[0, 79, 0] == 149 == G.slot_frame(79) + 1
+
+
+def test_gather_zero_fills_past_the_end():
+    """⭐ 超出已有长度的槽位填零 —— 上游 audio_encoder.py:209-212 的 else 分支。
+
+    这一半最容易漏：我第一版只做了「什么时候能开一轮」，取槽位直接拿索引，
+    冲句尾那一轮立刻 IndexError。两者是同一个契约的两半。
+    """
+    from worker.audio_stream import gather_slots
+    out = gather_slots(_embed(30), 0, G)          # 只有 30 帧，远不够一轮
+    # slot_frame(i) < 30 的那些槽位有值，其余全零
+    filled = [k for k in range(G.infer_frames) if out[0, k, 0] != 0]
+    assert filled == [k for k in range(G.infer_frames) if G.slot_frame(k) < 30]
+    assert out[0, G.infer_frames - 1, 0] == 0, "尾巴没填零"
+
+
+def test_gather_does_not_clamp_to_the_last_frame():
+    """⭐ **不能改成裁剪到最后一帧。**
+
+    裁剪的话句尾最后一个音素会被拖长成半秒，嘴型定在那儿不动 ——
+    比填零（闭嘴）难看得多，而且同样不报错。
+    """
+    from worker.audio_stream import gather_slots
+    out = gather_slots(_embed(30), 0, G)
+    assert out[0, G.infer_frames - 1, 0] != 30, "裁剪到了最后一帧，不是填零"
+
+
+def test_gather_second_repeat_offsets_correctly():
+    from worker.audio_stream import gather_slots
+    out = gather_slots(_embed(400), 1, G)
+    assert out[0, 0, 0] == G.slot_frame(G.infer_frames) + 1 == 151
