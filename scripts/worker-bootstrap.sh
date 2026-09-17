@@ -82,6 +82,65 @@ if ! "$VENV/bin/python" -c "import torch,sys; sys.exit(0 if torch.__version__.st
         --index-url https://download.pytorch.org/whl/cu128
 fi
 
+# ── 2c. 装 LiveAvatar 自己的依赖，然后**把 deepspeed 卸掉** ──────────
+say "装 requirements"
+"$VENV/bin/pip" install -q -r "$ROOT/requirements.txt"
+
+# ⚠️⚠️ **deepspeed 必须卸掉，否则 transformers 整个起不来。**
+#
+# requirements.txt 第 39 行有 deepspeed。装上之后：
+#
+#   transformers/modeling_utils.py:158  import deepspeed
+#     → deepspeed/runtime/hybrid_engine.py:26
+#         transformers.models.opt.modeling_opt.OPTLearnedPositionalEmbedding
+#       → modeling_opt.py:37  from ...modeling_utils import PreTrainedModel
+#         → 而 modeling_utils 正卡在自己第 158 行没初始化完
+#
+#   ImportError: cannot import name 'PreTrainedModel' from partially
+#   initialized module 'transformers.modeling_utils' (circular import)
+#
+# 后果是 `import peft` 和 `from transformers import PreTrainedModel` 全挂。
+# **transformers 只在检测到 deepspeed 存在时才走那一行** —— 所以是「装了它
+# 反而坏」，不装反而好。
+#
+# 推理不需要它：仓库里 deepspeed 只出现在 `liveavatar/utils/io_utils.py`，
+# 而且在 `if self.args.strategy == 'deepspeed'` 里面（读 ZeRO 训练 checkpoint），
+# 是训练路径，import 也是惰性的。
+#
+# 2026-09-17 在这上面绕了两圈：先怀疑 peft，又怀疑 torch 版本（还真去降了一遍
+# torch，没用）。**真因只有把完整调用链打出来才看得到** —— 顶层那句
+# 「Failed to import ... look up to see its traceback」把真凶藏在上面。
+"$VENV/bin/pip" uninstall -y -q deepspeed 2>/dev/null || true
+
+say "装 flash_attn_3（wheel 是 cu128torch280 版，跟上面钉的 torch 对齐）"
+"$VENV/bin/pip" install -q flash_attn_3 \
+    --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch280 || \
+    say "⚠️ flash_attn_3 没装上，注意力会退回较慢的后端"
+
+say "装 worker 侧要的 LiveKit"
+"$VENV/bin/pip" install -q "livekit-agents>=1.5" livekit aiohttp pillow
+
+# ── 2d. 核验：**装完必须真的 import 一遍** ──────────────────────────
+# 「pip 返回 0」在这个项目上已经骗过两次（见上面两处注释）。
+"$VENV/bin/python" - <<'VERIFY' || { say "❌ 环境核验没过，别往下走"; exit 1; }
+import importlib, sys
+bad = []
+for m in ("torch","transformers","peft","diffusers","flash_attn_3",
+          "librosa","onnxruntime","livekit.agents"):
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        bad.append(f"{m}({type(e).__name__})")
+try:
+    from transformers import PreTrainedModel          # deepspeed 那个坑的哨兵
+except Exception as e:
+    bad.append(f"PreTrainedModel({type(e).__name__})")
+import torch
+print(f"torch {torch.__version__} cuda {torch.version.cuda} gpus {torch.cuda.device_count()}")
+print("VERIFY-" + ("FAIL " + ",".join(bad) if bad else "PASS"))
+sys.exit(1 if bad else 0)
+VERIFY
+
 # ── 3. 权重（后台，很大）────────────────────────────────────────────
 mkdir -p "$CKPT"
 pull() {   # $1=HF repo  $2=本地目录名
