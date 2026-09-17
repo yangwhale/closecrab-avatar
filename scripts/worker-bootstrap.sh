@@ -44,9 +44,22 @@ fi
 
 # ── 2. venv ─────────────────────────────────────────────────────────
 # 不碰系统 Python：这台机器上还有别的东西在用。
+#
+# ⚠️⚠️ **绝对不要加 `--system-site-packages`。** 2026-09-17 被它咬了两次：
+#
+#   1. `pip install huggingface_hub` → 系统里已有，pip 判「已满足」什么都不装，
+#      **入口脚本 `hf` 从来没进 venv/bin**。包能 import，命令不存在。
+#   2. `pip install torch==2.8.0 --index-url .../cu128` → torch 本体装进来了，
+#      但配套的 `nvidia-*-cu12` 一堆库，pip 看到系统里有 cu129 版就判「已满足」，
+#      **cu128 那套压根没装** → `import torch` 直接
+#      `ImportError: libcusparseLt.so.0: cannot open shared object file`。
+#
+# 两次都是 **pip 返回 0**，只有真用到才炸。规矩：**要某个包的特定版本、而系统里
+# 也有它时，就别共享 site-packages。** 省那几个 G 换来一个说不清装了什么的环境，
+# 在 Spot 上尤其亏。
 if [[ ! -x "$VENV/bin/python" ]]; then
-    say "建 venv（--system-site-packages 复用已装好的 torch，省一次几个 G 的下载）"
-    python3 -m venv --system-site-packages "$VENV"
+    say "建干净 venv（不共享 system site-packages，见上方注释）"
+    python3 -m venv "$VENV"
 fi
 "$VENV/bin/pip" install -q --upgrade pip
 # ⚠️ **不要依赖 `hf` / `huggingface-cli` 这个命令行入口。**
@@ -56,6 +69,18 @@ fi
 #    下面直接用 Python API，绕开整件事。
 "$VENV/bin/pip" install -q huggingface_hub
 "$VENV/bin/python" -c "import huggingface_hub" || { echo "huggingface_hub 装不上"; exit 1; }
+
+# ── 2b. torch：**必须是 fork 验证过的那一版** ───────────────────────
+# README:125 写的是 torch 2.8.0 + cu128，flash_attn_3 的 wheel 也是
+# `cu128torch280` 版。机器自带的 2.9.1+cu129 看着更新，实际会让
+# transformers 4.51.3（requirements 的上限）在 modeling_opt 那里循环导入：
+#     from transformers import PreTrainedModel  → RuntimeError
+# 不是 peft 的锅，是 transformers 本身在那个 torch 上就起不来。
+if ! "$VENV/bin/python" -c "import torch,sys; sys.exit(0 if torch.__version__.startswith('2.8.0') else 1)" 2>/dev/null; then
+    say "装 torch 2.8.0 + cu128（fork 验证过的栈，几个 G，慢）"
+    "$VENV/bin/pip" install torch==2.8.0 torchvision==0.23.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+fi
 
 # ── 3. 权重（后台，很大）────────────────────────────────────────────
 mkdir -p "$CKPT"
