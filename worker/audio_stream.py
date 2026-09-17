@@ -1,223 +1,59 @@
-"""音频流式化的调度算术 —— P1 的主要工作量，这里是能离线钉死的那一半。
+"""块几何 —— 回调该返回多长一段 PCM。
 
-## 这个文件解决什么
+## 这个文件曾经有 200 行，现在只剩这么点
 
-上游 `get_audio_embed_bucket_fps()` 的签名是「**给我整段音频**，我告诉你要转几轮」。
-直播里拿不到整段：音频一块一块来，得「来一块编一块，还有音频就多转一轮」。
+原来这里有一整套「什么时候攒够一轮音频可以开工」的调度算术：
+`slot_frame` / `frames_needed_for_repeat` / `repeats_ready` / `gather_slots`…
+跟上游 `get_audio_embed_bucket_fps` 逐点对拍过，测试也齐。
 
-问题是能不能这么改**不是想当然** —— 得确认生成循环不会回头读到还没到的音频。
-下面每个常数和每条公式都标了上游出处，是读源码抄的，不是推的。
+**然后发现它全是多余的。**
 
-## 上游源码里的事实（fork `b200-realtime` @ 87fa0ea）
+上游的流式 pipeline 自己按块拉音频、自己编码
+（`_streaming_encode_next_audio_block_or_random` → `self.get_audio_callback()`），
+调用方**只需要回答一个问题：一块是多少个采样**。那套调度是我在不知道
+有这个回调时自己搭的第二套实现。
 
-`liveavatar/models/wan/wan_2_2/modules/s2v/audio_encoder.py`：
+留个记号是因为这类错误会重犯：**在自己实现一套调度之前，先确认被调用方
+是不是已经自己调度了。** 判据很简单 —— 看它向你「要」什么。它要整段
+（`audio_path`），你才需要切；它要下一块（callback），切的是它。
 
-    video_rate = 30                                              # :64
-    scale        = video_rate / fps                              # :176
-    min_batch_num = int(audio_frame_num / (batch_frames*scale)) + 1   # :178
-    bucket_num    = min_batch_num * batch_frames                 # :180
-    batch_idx     = get_sample_indices(..., fixed_start=0)       # :183
-    return batch_audio_eb, min_batch_num                         # :216  ← num_repeat
-
-`get_sample_indices` 在 `fixed_start=0` 时退化成一条等差斜坡：
-
-    time_points   = linspace(0, num_sample/fps, num_sample, endpoint=False)
-    frame_indices = round(time_points * video_rate)  = round(i * scale)
-
-**⭐ 关键：第 i 个槽位取哪一帧只跟 i 有关，跟总长无关。**
-总长只影响两件事 —— 一共有多少槽位，以及 `bi >= audio_frame_num` 的槽位填零。
-这一条就是「流式改造架构上不是死路」的真正依据。
-
-消费端 `causal_s2v_pipeline_tpp_blockwise.py` 也确认了只往前读：
-
-    audio_input = audio_emb[..., r*infer_frames : (r+1)*infer_frames]   # :843-848
-    ... audio_input[..., blk*(nfpb*4) : (blk+1)*(nfpb*4)]               # :864-873
-
-**没有任何一处读到 `(r+1)*infer_frames` 之后。**
-
-## 实测参数（全部来自源码，不是猜的）
-
-    video_rate    = 30     audio_encoder.py:64
-    fps           = 16     wan_base/configs/shared_config.py:18 (sample_fps)
-    infer_frames  = 80     causal_s2v_pipeline_tpp_blockwise.py:705 默认值
-    audio_sample_m = 0     causal_s2v_pipeline_tpp_blockwise.py:192
-
-于是 scale = 1.875，一轮吃 80×1.875 = 150 个音频嵌入帧 = **5 秒**，
-出 80 个视频帧 @16fps = **5 秒**。两边对得上，这就是外部锚点。
+（旧实现在 git 历史里，`git log -- worker/audio_stream.py`。）
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class BucketGeometry:
-    """把上游那套桶几何抄成可计算的形状。默认值即生产值，出处见模块注释。"""
+class BlockGeometry:
+    """一块的大小。默认值即生产值，出处见下。
 
-    video_rate: int = 30
+        fps               25     wan_2_2/configs/shared_config.py（**不是 wan_base 那份的 16**）
+        frames_per_block  12     num_frames_per_block(3) × 4
+        sample_rate    16000     audio_encoder.extract_audio_feat_from_array 的默认值
+    """
+
     fps: int = 25
-    infer_frames: int = 48
-    audio_sample_m: int = 0
+    frames_per_block: int = 12
+    sample_rate: int = 16000
 
     def __post_init__(self) -> None:
-        # 这几条都是上游隐含的前提。不满足时**必须炸**而不是算出个错的数 ——
-        # 算错的后果是嘴型和声音对不上，而那不会报任何错。
-        if self.fps <= 0 or self.video_rate <= 0 or self.infer_frames <= 0:
-            raise ValueError("video_rate / fps / infer_frames 都必须为正")
-        if self.audio_sample_m < 0:
-            raise ValueError("audio_sample_m 不能为负")
+        # 这几个值错了不会报错，只会让口型跟声音差一截 —— 宁可起不来。
+        if self.fps <= 0 or self.frames_per_block <= 0 or self.sample_rate <= 0:
+            raise ValueError("fps / frames_per_block / sample_rate 都必须为正")
 
     @property
-    def scale(self) -> float:
-        """一个视频帧对应几个音频嵌入帧。上游 `scale = video_rate / fps`。"""
-        return self.video_rate / self.fps
+    def block_seconds(self) -> float:
+        """一块对应多少秒视频。12 ÷ 25 = 0.48 s。"""
+        return self.frames_per_block / self.fps
 
     @property
-    def stride(self) -> int:
-        """取上下文时的步长。上游写的是 `int(video_rate / fps)` —— **截断不是四舍五入**，
-        30/16 → 1。照抄，别自作主张改成 round。
+    def block_samples(self) -> int:
+        """回调该返回多少个采样。
+
+        ⚠️ 这里用**音频采样率**（16 kHz），不是音频嵌入帧率（30 Hz），
+        也不是视频帧率。三个率长得都像「帧率」，拿错了差几个数量级，
+        而现象只是「怎么一直不出帧」。
         """
-        return int(self.video_rate / self.fps)
-
-    @property
-    def frames_per_repeat(self) -> float:
-        """一轮吃掉多少音频嵌入帧（可能不是整数）。"""
-        return self.infer_frames * self.scale
-
-    def slot_frame(self, slot: int) -> int:
-        """第 `slot` 个桶槽位取哪一个音频嵌入帧。
-
-        ⚠️ 这里**不做上限裁剪**。上游的裁剪用的是「整段音频的长度」，
-        流式下拿那个长度是不存在的；硬用当前已到长度去裁会得到不同的值，
-        而且是静默不同 —— 口型会整体前移，没人会报错。
-        裁剪的判断交给 `frames_needed_for_repeat` / `repeats_ready`。
-        """
-        if slot < 0:
-            raise ValueError("slot 不能为负")
-        # linspace(0, n/fps, n, endpoint=False) 的第 i 项就是 i/fps，
-        # 乘 video_rate 再 round —— 等价于 round(i * scale)。
-        #
-        # ⚠️ 上游用的是 `np.round`（五入到偶数），Python 内置 round 语义相同，
-        #    所以直接用。**哪天上游改成 floor 或 int()，这里要跟着改** ——
-        #    差一帧的后果是整段口型平移 1/30 秒，看得出但不报错。
-        return int(round(slot * self.scale))
-
-    def frames_needed_for_repeat(self, repeat: int) -> int:
-        """第 `repeat` 轮要**至少有多少个音频嵌入帧已经到了**，才能不靠猜地生成。
-
-        返回的是「帧数」不是「最大下标」—— 下标 + 1。
-        """
-        if repeat < 0:
-            raise ValueError("repeat 不能为负")
-        last_slot = (repeat + 1) * self.infer_frames - 1
-        # m > 0 时每个槽位还要往后看 m*stride 帧（上游 chosen_idx 的右端）。
-        # m == 0（生产值）时这一项是 0。
-        return self.slot_frame(last_slot) + self.audio_sample_m * self.stride + 1
-
-    def repeats_ready(self, frames_arrived: int, *, ended: bool) -> int:
-        """已经到了 `frames_arrived` 帧，现在能安全生成几轮。
-
-        - 流**没结束**：只算那些「所有槽位的音频都已到」的轮次。少一帧都不能开 ——
-          开了就要拿裁剪值凑，口型会错。
-        - 流**已结束**：剩下的尾巴也要出，不足的部分按上游语义填零。
-        """
-        if frames_arrived < 0:
-            raise ValueError("frames_arrived 不能为负")
-        if ended:
-            return self.repeats_for_finished_stream(frames_arrived)
-        r = 0
-        while self.frames_needed_for_repeat(r) <= frames_arrived:
-            r += 1
-        return r
-
-    def repeats_for_finished_stream(self, audio_frame_num: int) -> int:
-        """整段音频一共要转几轮。**这里故意跟上游不一样，看下面。**
-
-        上游是 `int(N / frames_per_repeat) + 1`（`min_batch_num`）。那个 `+1`
-        保证覆盖，但**恒定多出一轮**：N 正好等于 150 时它给 2，而第二轮里
-        第一个槽位取的帧下标就是 150 —— 已经越界，整轮几乎全是零填充。
-
-        离线多渲染 5 秒只是浪费。**直播里那是数字人对着空气动 5 秒嘴**，
-        用户会以为卡住了。所以流式这边用 `ceil`：
-
-            上游   int(N/150) + 1      N=150 → 2 轮（第 2 轮全是静音）
-            这里   max(1, ceil(N/150)) N=150 → 1 轮
-
-        **这是有意偏离，不是 bug。** 写成单独一个函数、配对拍测试，
-        就是为了让它不会被当成「哪里算错了」而被人「修」回去。
-        两者的差只可能是 0 或 1 轮，由 `upstream_num_repeat` 对拍。
-        """
-        if audio_frame_num < 0:
-            raise ValueError("audio_frame_num 不能为负")
-        if audio_frame_num == 0:
-            return 0          # 一点音频都没有就别转 —— 上游在这里会给 1 轮纯静音
-
-        # ⚠️ **用整数算，不能 `ceil(N / frames_per_repeat)`。**
-        #
-        # `frames_per_repeat = 48 * 30 / 25` 在浮点里是 **57.599999999999994**，
-        # 于是 `288 / 57.599999999999994 = 5.0000000000000005`，`ceil` 给 6 ——
-        # 多转一整轮纯静音，**正是这个 ceil 本来要避免的那件事**。
-        # 而且只在「刚好整除」时发作，平时完全看不出来。
-        #
-        # 等价的整数形式：ceil(N·fps / (infer_frames·video_rate))
-        num = audio_frame_num * self.fps
-        den = self.infer_frames * self.video_rate
-        return max(1, -(-num // den))
-
-    def upstream_num_repeat(self, audio_frame_num: int) -> int:
-        """**照抄**上游 `min_batch_num`，只用来对拍，不参与调度。
-
-        留着它是为了让偏离这件事有个锚：测试里逐点比对两者，
-        确认差值永远只是 0 或 1，而不是某个地方算歪了。
-        """
-        if audio_frame_num < 0:
-            raise ValueError("audio_frame_num 不能为负")
-        return int(audio_frame_num / self.frames_per_repeat) + 1
-
-
-
-def gather_slots(embed, repeat: int, geom: BucketGeometry):
-    """取第 `repeat` 轮要喂给模型的那 `infer_frames` 个槽位。
-
-    `embed` 形状 `(..., T, D)`，T 是已经到的嵌入帧数。返回 `(..., infer_frames, D)`。
-
-    ## ⚠️ 超出已有长度的槽位要**填零**，不是裁剪也不是报错
-
-    上游 `audio_encoder.py:209-212` 的 else 分支就是填零：
-
-        if bi < audio_frame_num:  取第 bi 帧
-        else:                     torch.zeros(...)
-
-    这一半很容易漏 —— 我第一版只实现了「什么时候能开一轮」，
-    直接拿索引去取，冲句尾那一轮立刻 `IndexError`。
-    两者是同一个契约的两半：**什么时候能渲** 和 **超出的部分喂什么**。
-
-    **不能改成裁剪到最后一帧**：那样句尾会把最后一个音素拖长成半秒，
-    嘴型定格在那儿不动 —— 比填零（闭嘴）难看得多，而且不报错。
-    """
-    import numpy as _np
-
-    have = embed.shape[-2]
-    lo = repeat * geom.infer_frames
-    idx = [geom.slot_frame(i) for i in range(lo, lo + geom.infer_frames)]
-
-    out = _np.zeros(embed.shape[:-2] + (geom.infer_frames, embed.shape[-1]),
-                    dtype=embed.dtype)
-    for k, bi in enumerate(idx):
-        if bi < have:
-            out[..., k, :] = embed[..., bi, :]
-        # else: 保持零 —— 上游语义
-    return out
-
-
-def seconds_to_embed_frames(seconds: float, geom: BucketGeometry) -> int:
-    """秒 → 音频嵌入帧数。
-
-    嵌入帧率是 30 Hz（wav2vec 出来是 50 Hz，`audio_encoder.py:86` 用
-    `linear_interpolation` 重采样到 `video_rate`）。**别拿 PCM 采样率去换算。**
-    """
-    if seconds < 0:
-        raise ValueError("seconds 不能为负")
-    return int(seconds * geom.video_rate)
+        return int(self.sample_rate * self.block_seconds)
