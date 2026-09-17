@@ -22,6 +22,12 @@ from livekit.agents.voice.avatar import AvatarOptions, AvatarRunner, DataStreamA
 
 from .generators import StaticImageGenerator
 
+# ⚠️ **不在顶层 import pipeline_source 之外的任何重依赖。**
+#    这个文件在控制面机器上也可能被 import（跑测试、查签名），
+#    而那台没有 torch。`pipeline_source` 顶层也只有 numpy。
+from .live_generator import LiveAvatarGenerator
+from .pipeline_source import LiveAvatarPipelineSource
+
 log = logging.getLogger("liveavatar.worker")
 
 HEARTBEAT_S = 10.0
@@ -42,12 +48,42 @@ def _load_image(path: str | None, size: tuple[int, int]) -> np.ndarray:
 
 class Worker:
     def __init__(self, gateway_url: str, worker_id: str, *, capacity: int = 1,
-                 image_path: str | None = None):
+                 image_path: str | None = None,
+                 ckpt_dir: str = "", training_config: str = ""):
         self._gw = gateway_url.rstrip("/")
         self._id = worker_id
         self._capacity = capacity
         self._image_path = image_path
+        self._ckpt_dir = ckpt_dir
+        self._training_config = training_config
         self._active: set[str] = set()
+        self._model_ready = self._detect_model()
+
+    def _detect_model(self) -> bool:
+        """有没有真模型可用。**判据是「能不能跑」，不是「装没装」。**
+
+        三个条件缺一不可，而且缺任何一个的症状都是「画面是张不动的图」——
+        所以这里逐条查、逐条说，别笼统报一句「模型不可用」。
+        """
+        import os.path
+
+        if not self._ckpt_dir or not os.path.isdir(self._ckpt_dir):
+            log.warning("没有权重目录（%s）→ 退回静帧", self._ckpt_dir or "未指定")
+            return False
+        try:
+            import torch.distributed as dist
+        except Exception:
+            log.warning("没装 torch → 退回静帧")
+            return False
+        if not dist.is_available() or not dist.is_initialized():
+            # 五卡流式必须在 torchrun 下跑。**这是最常见的一种「没生效」**：
+            # 直接 `python -m worker.runner` 起来一切正常，就是画面不动。
+            log.warning("不在 torchrun 下（dist 未初始化）→ 退回静帧。"
+                        "五卡流式见 docs/deploy.md「五卡流式怎么起」")
+            return False
+        log.info("真模型可用：rank %d/%d，权重 %s",
+                 dist.get_rank(), dist.get_world_size(), self._ckpt_dir)
+        return True
 
     async def run(self) -> None:
         async with aiohttp.ClientSession() as http:
@@ -106,8 +142,25 @@ class Worker:
             log.info("会话 %s 已进房 %s", psid, job["room_name"])
 
             w, h = (int(x) for x in job.get("size", "384*256").split("*"))
-            img = _load_image(job.get("image_path") or self._image_path, (w, h))
-            gen = StaticImageGenerator(img, fps=25)
+
+            # 有模型就用真的，没有就退回静帧 —— **退回要说出来**，
+            # 否则「怎么是张不动的图」得查半天。
+            if self._model_ready:
+                src = LiveAvatarPipelineSource(
+                    ref_image_path=job.get("image_path") or self._image_path,
+                    prompt=job.get("prompt", ""),
+                    ckpt_dir=self._ckpt_dir,
+                    training_config=self._training_config,
+                    size=f"{w}*{h}",
+                    infer_frames=int(job.get("infer_frames", 48)),
+                )
+                gen = LiveAvatarGenerator(src)
+                log.info("会话 %s 用真模型", psid)
+            else:
+                img = _load_image(job.get("image_path") or self._image_path, (w, h))
+                gen = StaticImageGenerator(img, fps=25)
+                log.warning("会话 %s **退回静帧**（没检测到模型，"
+                            "看 --ckpt-dir 和 torchrun 起没起）", psid)
 
             runner = AvatarRunner(
                 room,
@@ -148,6 +201,11 @@ def main() -> int:
         "LA_WORKER_ID", f"{socket.gethostname()}-{os.environ.get('CUDA_VISIBLE_DEVICES','0')}"))
     ap.add_argument("--capacity", type=int, default=int(os.environ.get("LA_WORKER_CAPACITY", "1")))
     ap.add_argument("--image", default=os.environ.get("LA_AVATAR_IMAGE"))
+    ap.add_argument("--ckpt-dir", default=os.environ.get(
+        "LA_CKPT_DIR", os.path.expanduser("~/LiveAvatar/ckpt/Wan2.2-S2V-14B")))
+    ap.add_argument("--training-config", default=os.environ.get(
+        "LA_TRAINING_CONFIG",
+        os.path.expanduser("~/LiveAvatar/liveavatar/configs/s2v_causal_sft.yaml")))
     a = ap.parse_args()
     try:
         asyncio.run(Worker(a.gateway, a.worker_id, capacity=a.capacity, image_path=a.image).run())
