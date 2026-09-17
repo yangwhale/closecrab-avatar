@@ -160,10 +160,35 @@ class Worker:
                 ),
             )
             await runner.start()
-            # 房间断开即结束；控制面那边还有 idle 超时兜底
-            disconnected = asyncio.Event()
-            room.on("disconnected", lambda *_: disconnected.set())
-            await disconnected.wait()
+
+            # ⚠️ **不能只听 `disconnected`。** 那个事件只在**自己**被断开时触发，
+            #    agent 走了我们照样连着 —— 于是一个人待在空房间里，心跳还
+            #    照常把会话的 `updated_at` 往前推，控制面那 120 秒空闲回收
+            #    **永远等不到**。槽位就被一个没人的房间占死了。
+            #    （实测过：会话建了 94 秒，updated_at 永远停在 17 秒前。）
+            over = asyncio.Event()
+            agent_id = job["agent_identity"]
+            room.on("disconnected", lambda *_: over.set())
+
+            @room.on("participant_disconnected")
+            def _(p: rtc.RemoteParticipant) -> None:
+                if p.identity == agent_id:
+                    log.info("会话 %s：agent %s 走了，跟着收摊", psid, agent_id)
+                    over.set()
+
+            # agent 可能在我们挂上监听之前就进了又走了 —— 那样事件永远不来。
+            # **事件之外再补一次当下的状态**，别只信事件。
+            grace = job.get("agent_join_grace_s", 30)
+            deadline = asyncio.get_running_loop().time() + grace
+            while (not over.is_set() and agent_id not in room.remote_participants
+                   and asyncio.get_running_loop().time() < deadline):
+                await asyncio.sleep(0.5)
+            if not over.is_set() and agent_id not in room.remote_participants:
+                log.warning("会话 %s：%ss 内等不到 agent %s 进房，收摊",
+                            psid, grace, agent_id)
+                over.set()
+
+            await over.wait()
         except Exception:
             log.exception("会话 %s 异常结束", psid)
         finally:
