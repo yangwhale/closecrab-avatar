@@ -144,3 +144,45 @@ def test_meta_json_is_readable_by_humans(store):
     d = json.loads((pathlib.Path(store._root) / "bunny.json")   # noqa: SLF001
                    .read_text(encoding="utf-8"))
     assert d["note"] == "矮人铁匠" and d["ext"] == ".jpg"
+
+
+# ── ⭐ 历史：换脸不能是不可逆的 ────────────────────────────────────
+
+def test_overwrite_archives_the_previous_image(store):
+    """⭐ 这条是赔出来的。
+
+    2026-09-18 Chris 从手机传了一张 5712×4284 的照片，十二分钟后我用生成图
+    覆盖，**他那张原图就没了** —— 旧实现「换格式就 unlink 掉旧的」。
+    形象图是用户手里可能没有副本的东西，这一层不该做不可逆删除。
+    """
+    first = store.put("bunny", JPEG, note="手机拍的")
+    store.put("bunny", PNG, note="生成的")
+
+    hist = store.history("bunny")
+    assert [h.version for h in hist] == [first.version]
+    assert hist[0].note == "手机拍的"
+    got = store.read_history_image("bunny", first.version)
+    assert got is not None and got[0] == JPEG
+
+
+def test_same_image_twice_does_not_pile_up_history(store):
+    """同一张重传不该攒历史 —— 版本没变就不是「换过」。"""
+    store.put("bunny", JPEG)
+    store.put("bunny", JPEG)
+    assert len({h.version for h in store.history("bunny")}) <= 1
+
+
+def test_history_is_capped(store):
+    """一张几 MB，不设上限迟早把盘塞满。"""
+    from closecrab_avatar.persona import HISTORY_KEEP
+    for i in range(HISTORY_KEEP + 5):
+        store.put("bunny", JPEG + bytes([i % 251]) * 8)
+    assert len(store.history("bunny")) <= HISTORY_KEEP
+
+
+def test_archive_failure_does_not_block_upload(store, monkeypatch):
+    """⭐ 归档是保险不是主线 —— 存不下历史也不能拒绝换脸。"""
+    store.put("bunny", JPEG)
+    monkeypatch.setattr(store, "_trim_history",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("盘满了")))
+    assert store.put("bunny", PNG).content_type == "image/png"

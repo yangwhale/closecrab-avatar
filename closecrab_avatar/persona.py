@@ -48,6 +48,11 @@ _MAGIC: tuple[tuple[bytes, str, str], ...] = (
     (b"RIFF", "image/webp", ".webp"),          # 还要再看 8..12 是不是 WEBP
 )
 
+HISTORY_KEEP = 10
+"""换掉的旧形象图留几张。**不能不留** —— 用户手里未必有副本
+（相册那张可能已经裁过，或者干脆是别人发来的）。也不能无限留，
+一张几 MB，迟早把盘塞满。"""
+
 MAX_BYTES = 12 * 1024 * 1024
 """单张上限。参考图是拿来当一帧画面用的，没有理由超过这个量级；
 不设上限的话一个手滑就能把控制面的磁盘塞满。"""
@@ -139,11 +144,21 @@ class PersonaStore:
         p = Persona(room=self._safe(room), version=version, content_type=ctype,
                     bytes_len=len(data), width=w, height=h, note=note)
 
+        # ⭐ **换之前先把旧的那张归档。**
+        #
+        # 原来这里是直接 unlink 掉旧格式那份，理由是「目录里留两张说不清谁是
+        # 当前的」。理由没错，但代价没想清楚：2026-09-18 Chris 从手机传了一张
+        # 5712×4284 的照片，十二分钟后我用生成图覆盖，**他那张原图就没了**。
+        #
+        # 形象图是**用户手里可能没有副本**的东西（相册里那张已经被裁过、
+        # 或者干脆是别人发来的）。这一层不该做不可逆的删除。
+        self._archive_current(room)
+
         # 先写临时文件再原子改名 —— 半截文件会让 worker 在加载时报一个
         # 看起来像「模型坏了」的错。
         img = self._img_path(room, ext)
         self._atomic_write(img, data)
-        # 换了格式的话把旧的那份删掉，免得目录里两张图说不清谁是当前的。
+        # 当前那张只能有一份，其余格式的清掉（上面已经归档过了）。
         for _, _, other in _MAGIC:
             if other != ext:
                 self._img_path(room, other).unlink(missing_ok=True)
@@ -183,6 +198,61 @@ class PersonaStore:
         for _, _, ext in _MAGIC:
             self._img_path(room, ext).unlink(missing_ok=True)
         return found
+
+    # ── 历史 ──────────────────────────────────────────────────────
+
+    def _hist_dir(self, room: str) -> pathlib.Path:
+        return self._root / "history" / self._safe(room)
+
+    def _archive_current(self, room: str) -> None:
+        """把当前那张挪进 history。**失败不能挡住上传** ——
+        归档是保险，不是主线；因为存不下历史而拒绝换脸是本末倒置。
+        """
+        try:
+            got = self.read_image(room)
+            meta = self.get(room)
+            if got is None or meta is None:
+                return
+            data, _ = got
+            d = self._hist_dir(room)
+            d.mkdir(parents=True, exist_ok=True)
+            ext = json.loads(self._meta_path(room).read_text(encoding="utf-8")).get("ext", ".jpg")
+            self._atomic_write(d / f"{meta.version}{ext}", data)
+            self._atomic_write(d / f"{meta.version}.json",
+                               json.dumps(meta.to_json(), ensure_ascii=False).encode())
+            self._trim_history(room)
+        except Exception:                            # noqa: BLE001
+            log.warning("房间 %s 的旧形象图没归档成功（不影响这次上传）", room, exc_info=True)
+
+    def _trim_history(self, room: str, keep: int = HISTORY_KEEP) -> None:
+        """只留最近 keep 张。图是几 MB 一张，不设上限迟早把盘塞满。"""
+        d = self._hist_dir(room)
+        imgs = sorted((p for p in d.glob("*") if p.suffix != ".json"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in imgs[keep:]:
+            old.unlink(missing_ok=True)
+            old.with_suffix(".json").unlink(missing_ok=True)
+
+    def history(self, room: str) -> list[Persona]:
+        """按新到旧列出换掉过的那些。"""
+        d = self._hist_dir(room)
+        if not d.is_dir():
+            return []
+        out = []
+        for meta in sorted(d.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                out.append(Persona(**json.loads(meta.read_text(encoding="utf-8"))))
+            except Exception:                        # noqa: BLE001
+                continue
+        return out
+
+    def read_history_image(self, room: str, version: str) -> tuple[bytes, str] | None:
+        d = self._hist_dir(room)
+        for _, ctype, ext in _MAGIC:
+            f = d / f"{version}{ext}"
+            if f.exists():
+                return f.read_bytes(), ctype
+        return None
 
     def rooms(self) -> list[str]:
         return sorted(p.stem for p in self._root.glob("*.json"))
