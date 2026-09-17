@@ -98,8 +98,11 @@ class BucketGeometry:
             raise ValueError("slot 不能为负")
         # linspace(0, n/fps, n, endpoint=False) 的第 i 项就是 i/fps，
         # 乘 video_rate 再 round —— 等价于 round(i * scale)。
-        # 用 numpy 的 round 语义（banker's rounding）与上游 np.round 对齐。
-        return _np_round_half_even(slot * self.scale)
+        #
+        # ⚠️ 上游用的是 `np.round`（五入到偶数），Python 内置 round 语义相同，
+        #    所以直接用。**哪天上游改成 floor 或 int()，这里要跟着改** ——
+        #    差一帧的后果是整段口型平移 1/30 秒，看得出但不报错。
+        return int(round(slot * self.scale))
 
     def frames_needed_for_repeat(self, repeat: int) -> int:
         """第 `repeat` 轮要**至少有多少个音频嵌入帧已经到了**，才能不靠猜地生成。
@@ -162,17 +165,6 @@ class BucketGeometry:
             raise ValueError("audio_frame_num 不能为负")
         return int(audio_frame_num / self.frames_per_repeat) + 1
 
-
-def _np_round_half_even(x: float) -> int:
-    """跟 `np.round` 一样的「五入到偶数」，不是 Python 内置 round 的语义……
-
-    其实两者一致（Python3 的 round 也是 banker's rounding），单独写一个函数
-    是为了**把这件事说出来**：上游用的是 `np.round`，如果哪天改成
-    `np.floor` 或者 `int()`，这里要跟着改，而不是各自为政。
-
-    差一帧的后果：整段口型平移 1/30 秒。听不出、但看得出，而且不会报错。
-    """
-    return int(round(x))
 
 
 def seconds_to_embed_frames(seconds: float, geom: BucketGeometry) -> int:
