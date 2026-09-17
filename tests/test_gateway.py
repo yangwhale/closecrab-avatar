@@ -165,3 +165,49 @@ def test_idempotency_is_per_key(store):
     """别的租户用同一个 Idempotency-Key 不能读到你的结果。"""
     store.put_idempotent("idem-1", "k1", {"session_id": "A"})
     assert store.get_idempotent("idem-1", "k2") is None
+
+
+# ── 2026-09-17 部署时抓到的：空闲 worker 死掉是完全无声的 ──────────────
+
+def test_sweeps_an_idle_worker_that_died(tmp_path):
+    """⭐ 一个**从没接过活**的 worker 心跳断了，也必须被摘掉并报出来。
+
+    原实现遍历的是 `active_counts()` —— 只含有 pending/active 会话的 worker。
+    空闲 worker 一条会话都没有，于是永远不在那个字典里：
+    行留在表里、`sweep_dead_workers()` 返回空、**那条 warning 一个字都不打**。
+
+    而 `docs/deployment.md` 教人「槽位不对就去日志里查心跳丢失」——
+    最该报警的情况恰恰完全无声。骗人的地方在于 `capacity()` 走的是
+    `live_workers()`，槽位数**会**正确地掉下去，看起来一切正常。
+    """
+    import time as _t
+    from liveavatar_gateway.scheduler import Scheduler
+    from liveavatar_gateway.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    sched = Scheduler(store, heartbeat_timeout_s=0.05)
+    store.upsert_worker("idle-gpu", 8, {})          # 注册完就再没动静
+
+    assert sched.capacity().total == 8
+    _t.sleep(0.08)                                   # 心跳过期
+
+    assert sched.sweep_dead_workers() == ["idle-gpu"], "空闲 worker 没被摘"
+    assert sched.capacity().total == 0
+    # 摘干净了：行要真的没了，否则 Spot 每重建一次多一行
+    assert sched.sweep_dead_workers() == [], "摘完还在，drop_worker 没生效"
+
+
+def test_still_sweeps_a_busy_worker(tmp_path):
+    """原来那条路径不能修坏：有会话的 worker 照样要摘，会话置 closed 不删。"""
+    import time as _t
+    from liveavatar_gateway.scheduler import Scheduler
+    from liveavatar_gateway.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    sched = Scheduler(store, heartbeat_timeout_s=0.05)
+    store.upsert_worker("busy-gpu", 4, {})
+    store.create_session(_sess("p-busy", "busy-gpu"))
+
+    _t.sleep(0.08)
+    assert sched.sweep_dead_workers() == ["busy-gpu"]
+    assert sched.capacity().used == 0, "会话没被关掉，槽位仍被占着"

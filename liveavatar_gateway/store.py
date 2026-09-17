@@ -102,6 +102,20 @@ class Store:
         return [Worker(r["worker_id"], r["capacity"], r["last_seen"], json.loads(r["meta"]))
                 for r in rows]
 
+    def stale_worker_ids(self, timeout_s: float) -> list[str]:
+        """心跳过期的 worker —— **全部**，不管它身上有没有会话。
+
+        ⚠️ 别用「有会话的那批」反推。一个空闲 worker 死掉时它一条会话都没有，
+        按会话找永远找不到它：行留在表里、也不会有任何日志。见
+        `Scheduler.sweep_dead_workers` 上面那段。
+        """
+        cutoff = time.time() - timeout_s
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT worker_id FROM workers WHERE last_seen < ?", (cutoff,)
+            ).fetchall()
+        return [r["worker_id"] for r in rows]
+
     def drop_worker(self, worker_id: str) -> None:
         with self._lock:
             self._db.execute("DELETE FROM workers WHERE worker_id=?", (worker_id,))

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from fastapi import FastAPI
@@ -72,4 +73,30 @@ def load_keyring(raw: str | None = None) -> KeyRing:
 
 def build() -> FastAPI:
     """`uvicorn --factory liveavatar_gateway.entry:build`"""
+    _configure_logging()
     return create_app(Settings.from_env(), load_keyring())
+
+
+def _configure_logging() -> None:
+    """让**应用自己的**日志也出得去。
+
+    ⚠️ uvicorn 只配它自己那几个 logger（`uvicorn.*`）。我们的
+    `logging.getLogger("liveavatar...")` 没有 handler，于是走到 root ——
+    而 root 默认是 WARNING 且没 handler，**结果就是一条都不打**。
+
+    2026-09-17 实测：systemd journal 里只有访问日志，
+    「回收超时会话」「worker 心跳丢失，已摘除」这两条**从来没出现过**。
+    功能是好的（槽位确实回收了），但**它哪天坏掉会完全无声** ——
+    而这两条恰恰是槽位泄漏时唯一的线索，泄漏一路就少一张卡。
+
+    不用 dictConfig 大动干戈：只要给 root 挂一个 handler、级别拉到 INFO。
+    uvicorn 自己那套 propagate=False，不会被影响成双份。
+    """
+    root = logging.getLogger()
+    if any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        return                      # 已经配过（比如被别的入口先调了），别叠
+    h = logging.StreamHandler()
+    # 有 journal 自己的时间戳了，这里只带 级别/模块/正文，别重复。
+    h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root.addHandler(h)
+    root.setLevel(logging.INFO)

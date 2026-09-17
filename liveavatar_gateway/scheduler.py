@@ -54,13 +54,30 @@ class Scheduler:
         """心跳丢失的 worker：关掉它身上的会话并摘掉它。
 
         ⚠️ 不删会话记录，只置 closed —— 留痕才查得出「这一路是怎么没的」。
+
+        ## 2026-09-17：这里原来只扫「身上有会话的」worker
+
+        原写法是 `for worker_id in self._store.active_counts()` —— 那个字典
+        **只包含有 pending/active 会话的 worker**。于是一个**空闲** worker
+        死掉时：
+
+          · 它一条会话都没有 → 不在 counts 里 → 永远不会被摘
+          · `drop_worker` 不调 → 行永远留在表里（Spot 每重建一次多一行）
+          · **那条「心跳丢失，已摘除」的 warning 一个字都不打**
+
+        最后一条最要命：`docs/deployment.md` 教人「槽位不对就去日志里查
+        心跳丢失」，而**最该报警的情况恰恰完全无声** —— GPU 机器空闲时挂了，
+        你以为还有 8 路，实际 0 路，日志干干净净。
+
+        `capacity()` 走的是 `live_workers()`，所以槽位数**会**立刻掉下去 ——
+        这正是它骗人的地方：**表面现象是对的，缺的只有那条线索**。
+
+        单测抓不到：测试里的 worker 都是连着会话一起造出来的。
+        是部署之后拿一个真的空闲 worker 试出来的。
         """
-        live = {w.worker_id for w in self._store.live_workers(self._hb_timeout)}
         dropped: list[str] = []
-        counts = self._store.active_counts()
-        for worker_id in counts:
-            if worker_id not in live:
-                self._store.close_sessions_of_worker(worker_id)
-                self._store.drop_worker(worker_id)
-                dropped.append(worker_id)
+        for worker_id in self._store.stale_worker_ids(self._hb_timeout):
+            self._store.close_sessions_of_worker(worker_id)   # 没有也无所谓
+            self._store.drop_worker(worker_id)
+            dropped.append(worker_id)
         return dropped
