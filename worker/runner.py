@@ -208,7 +208,9 @@ def main() -> int:
         os.path.expanduser("~/LiveAvatar/liveavatar/configs/s2v_causal_sft.yaml")))
     a = ap.parse_args()
     try:
-        asyncio.run(Worker(a.gateway, a.worker_id, capacity=a.capacity, image_path=a.image).run())
+        asyncio.run(Worker(a.gateway, a.worker_id, capacity=a.capacity,
+                           image_path=a.image, ckpt_dir=a.ckpt_dir,
+                           training_config=a.training_config).run())
     except KeyboardInterrupt:
         return 130
     return 0
