@@ -55,6 +55,7 @@ def test_block_length_is_always_exact():
     """
     box = make()
     box.push(i16(160))                       # 远不足
+    box.mark_segment_end()                   # 放行尾巴
     assert len(box.pull_block()) == G.block_samples
     box.push(i16(G.sample_rate * 5))         # 远超
     for _ in range(5):
@@ -81,9 +82,47 @@ def test_partial_tail_is_padded_not_dropped():
     """
     box = make()
     box.push(i16(1000))
+    box.mark_segment_end()
     chunk = box.pull_block()
     assert np.count_nonzero(chunk) == 1000
     assert len(chunk) == G.block_samples
+
+
+# ── ⭐ 攒够一整块才放行 ────────────────────────────────────────────
+
+def test_partial_audio_does_not_trigger_a_block():
+    """⭐ 这条是实测出来的 bug。
+
+    LiveKit 按 100 ms 一包推音频，一块是 480 ms。「有货就放行」的话每个
+    小包都触发一整块生成、四分之三是补的静音 —— 实测三次会话 53 秒音频
+    生成了 210 块（该 110 块），出帧队列灌满开始丢帧，**表现成帧率越跑
+    越低**，看起来像 GPU 不够。
+    """
+    box = make()
+    done = threading.Event()
+    threading.Thread(target=lambda: (box.pull_block(), done.set()),
+                     daemon=True).start()
+    for _ in range(4):                       # 4 × 100 ms = 400 ms < 480 ms
+        box.push(i16(1600))
+        time.sleep(0.02)
+    assert not done.wait(0.3), "不够一块就放行了 —— 会生成大半是静音的块"
+    box.push(i16(1600))                      # 第 5 包，够了
+    assert done.wait(2.0), "攒够一块了却没放行"
+
+
+def test_segment_end_releases_then_rearms():
+    """放完尾巴要**回到**「攒够才放行」，否则下一句又被小包触发。"""
+    box = make()
+    box.push(i16(1000))
+    box.mark_segment_end()
+    box.pull_block()                         # 尾巴放出去了
+    assert box.pending_samples == 0
+
+    done = threading.Event()
+    threading.Thread(target=lambda: (box.pull_block(), done.set()),
+                     daemon=True).start()
+    box.push(i16(1600))                      # 新一句的第一个小包
+    assert not done.wait(0.3), "放完尾巴没回到「攒够才放行」"
 
 
 def test_pcm_is_consumed_in_order_without_gaps():
@@ -91,6 +130,7 @@ def test_pcm_is_consumed_in_order_without_gaps():
     box = make()
     box.push(i16(4800, value=100))
     box.push(i16(4800, value=200))           # 合计 9600
+    box.mark_segment_end()                   # 放行第二块那 1920 个尾巴
     first = box.pull_block()
     assert np.count_nonzero(first) == G.block_samples, "第一块就出现空洞"
     second = box.pull_block()
@@ -167,6 +207,7 @@ def test_no_samples_lost_under_concurrent_push_and_pull():
         for _ in range(chunks):
             box.push(i16(per, value=1))
             time.sleep(0)                     # 让出，制造交错
+        box.mark_segment_end()                # 说完了，尾巴也要放出来
 
     t = threading.Thread(target=writer, daemon=True)
     t.start()

@@ -94,6 +94,10 @@ class LiveAvatarGenerator(VideoGenerator):
             # ⚠️ 段落结束**不清缓冲** —— 剩下那点不足一块的音频还要说完。
             #    真正该清的只有打断（`clear_buffer`）。混为一谈的话每句话
             #    结尾都会被吞掉一截，而且听起来像「他话没说完」。
+            #
+            # ⭐ 但要**明确放行**那截尾巴：inbox 平时攒够一整块才给模型，
+            #    不放行的话最后不足一块的部分会一直卡在缓冲里等下一句。
+            self._src.inbox.mark_segment_end()
             await self._audio_out.put(frame)
             return
 

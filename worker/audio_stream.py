@@ -87,6 +87,20 @@ class PcmInbox:
     `append` / `pop(0)` 各自原子，但 `self._buf[0] = head[take:]` 跟 `pop(0)`
     之间不原子 —— 会丢样本或重复。症状是口型偶尔跟声音错开，**不报错**。
 
+    ## ⭐ 放行的判据是「攒够一整块」，不是「有没有货」
+
+    这条踩过。原来写的是「有一个采样就返回，剩下补静音」，看着挺合理 ——
+    直到实测发现三次会话一共 53 秒音频却生成了 210 块（该有 110 块）。
+
+    原因：LiveKit **按 100 ms 一包**推音频，而一块是 480 ms。「有货就放行」
+    意味着每来一个小包就触发一整块生成，其中四分之三是补出来的静音。
+    生成速率冲到需求的四五倍，出帧队列被灌满、开始丢最旧的帧 ——
+    **表现出来是帧率越跑越低**，看起来像 GPU 不够，其实是喂法不对。
+
+    所以攒够 `block_samples` 才放行。句尾那点不足一块的，靠
+    `mark_segment_end()` 明确放行 —— LiveKit 协议里本来就有 `AudioSegmentEnd`
+    这个信号，它的意思正是「这句说完了」。
+
     ## 没货的时候会**阻塞**，这也是故意的
 
     换成「没货就立刻返回静音」的话，整条五卡流水线会以 1.66× 实时的速度
@@ -99,32 +113,45 @@ class PcmInbox:
     def __init__(self, geom: BlockGeometry):
         self._geom = geom
         self._buf: list[np.ndarray] = []
-        self._lock = threading.Lock()
-        self._has_data = threading.Event()
+        self._pending = 0
+        self._cv = threading.Condition()
+        self._draining = False      # 句子说完了，剩下这点尾巴也要放行
         self._closed = False
 
     # ── 事件循环那一侧 ──────────────────────────────────────────────
 
     def push(self, pcm_i16: np.ndarray) -> None:
-        with self._lock:
+        with self._cv:
             self._buf.append(pcm_i16)
-            self._has_data.set()
+            self._pending += len(pcm_i16)
+            self._cv.notify_all()
+
+    def mark_segment_end(self) -> None:
+        """这句说完了 —— 不足一块的尾巴也放行。
+
+        ⚠️ **不是打断**，不清缓冲。混为一谈的话每句话结尾都被吞掉一截，
+        听起来像「他话没说完」。
+        """
+        with self._cv:
+            self._draining = True
+            self._cv.notify_all()
 
     def clear(self) -> None:
         """打断。**把没念的全扔了。**
 
         人已经不说话了而屏幕上的嘴还在动，恐怖谷一下就掉进去。
         """
-        with self._lock:
+        with self._cv:
             self._buf.clear()
-            if not self._closed:
-                self._has_data.clear()
+            self._pending = 0
+            self._draining = False
+            self._cv.notify_all()
 
     def close(self) -> None:
         """进程要退了。把阻塞中的模型线程放出来，否则 join 不回来。"""
-        with self._lock:
+        with self._cv:
             self._closed = True
-            self._has_data.set()
+            self._cv.notify_all()
 
     @property
     def closed(self) -> bool:
@@ -132,27 +159,31 @@ class PcmInbox:
 
     @property
     def pending_samples(self) -> int:
-        with self._lock:
-            return sum(len(x) for x in self._buf)
+        with self._cv:
+            return self._pending
 
     # ── 模型线程那一侧 ──────────────────────────────────────────────
+
+    def _ready(self) -> bool:
+        return (self._closed
+                or self._pending >= self._geom.block_samples
+                or (self._draining and self._pending > 0))
 
     def pull_block(self, timeout: float | None = None) -> np.ndarray:
         """模型每个 block 调一次。**恒定返回 `block_samples` 个 float32。**
 
         长度不固定的话模型侧的编码窗口会错位 —— 不报错，只是口型差一截。
 
-        - 一个采样都没有 → **阻塞等**（见类文档，这是省电那一环）
-        - 有但不够一块 → 补静音凑满。这是句尾的正常形态，
-          补出来的静音正好让嘴闭上
-        - 给了 `timeout` 且等超时 → 返回整块静音（留给「待机也要出画面」那种形态）
+        放行条件（见类文档）：攒够一整块，或者 `mark_segment_end()` 说这句
+        完了。都不满足就**阻塞**。给了 `timeout` 且等超时则返回整块静音，
+        留给「待机也要出画面」那种形态。
         """
-        self._has_data.wait(timeout)
-
         need = self._geom.block_samples
         out = np.zeros(need, dtype=np.float32)
-        filled = 0
-        with self._lock:
+        with self._cv:
+            self._cv.wait_for(self._ready, timeout)
+
+            filled = 0
             while filled < need and self._buf:
                 head = self._buf[0]
                 take = min(need - filled, len(head))
@@ -161,10 +192,13 @@ class PcmInbox:
                 # 只是口型对不上。
                 out[filled:filled + take] = head[:take].astype(np.float32) / 32768.0
                 filled += take
+                self._pending -= take
                 if take == len(head):
                     self._buf.pop(0)
                 else:
                     self._buf[0] = head[take:]
-            if not self._buf and not self._closed:
-                self._has_data.clear()
+            if not self._buf:
+                # 尾巴放完了，回到「攒够才放行」。不清的话下一轮又会被
+                # 一个 100 ms 的小包触发整块生成。
+                self._draining = False
         return out

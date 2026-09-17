@@ -92,9 +92,11 @@ def _gateway_key() -> tuple[str, str]:
 class _Collector:
     """订阅数字人的视频轨，逐帧记账。"""
 
-    def __init__(self, avatar_identity: str, out_dir: pathlib.Path | None):
+    def __init__(self, avatar_identity: str, out_dir: pathlib.Path | None,
+                 every: int = 25):
         self.identity = avatar_identity
         self.out = out_dir
+        self.every = max(1, every)
         self.count = 0
         self.first_at: float | None = None
         self.last_at: float | None = None
@@ -119,7 +121,7 @@ class _Collector:
                 self.size = (f.width, f.height)
             self.last_at = now
             self.count += 1
-            if self.out is not None and self.count % 25 == 1:
+            if self.out is not None and self.count % self.every == 1 % max(self.every, 1):
                 # 存图只是方便人眼看一下，**炸了不能把收帧带走** ——
                 # 否则一个 PIL 没装就让整次测量报「没收到帧」，
                 # 结论跟真的模型没跑一模一样。
@@ -213,7 +215,7 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
                                          can_publish=False, can_subscribe=True))
             .to_jwt())
     viewer = rtc.Room()
-    col = _Collector(avatar_identity, out_dir)
+    col = _Collector(avatar_identity, out_dir, every=a.save_every)
     col.attach(viewer)
     await viewer.connect(a.livekit_url, vtok)
 
@@ -267,7 +269,7 @@ def _report(a, col: _Collector, secs: float, t_audio0: float) -> int:
     print(f"  实测帧率   {fps:.1f} fps")
     print(f"  覆盖时长   {col.count / max(fps, 1e-9):.1f} s（音频 {secs:.1f} s）")
     if a.out:
-        print(f"  抽帧       {a.out}/frame-*.jpg（每 25 帧一张）")
+        print(f"  抽帧       {a.out}/frame-*.jpg（每 {a.save_every} 帧一张）")
 
     ok = True
     if first > a.max_first_frame:
@@ -288,7 +290,8 @@ async def _terminate(http, a, headers, psid: str, terminate_token: str) -> None:
     try:
         async with http.post(
             f"{a.gateway}/avatar/sessions/terminate",
-            json={"provider_session_id": psid, "terminate_token": terminate_token},
+            json={"provider": "liveavatar", "provider_session_id": psid,
+                  "terminate_token": terminate_token},
             headers=headers,
         ) as r:
             if r.status != 200:
@@ -306,6 +309,8 @@ def main() -> int:
     p.add_argument("--audio", required=True, help="16 kHz 单声道 16 bit wav")
     p.add_argument("--room", default=f"e2e-{os.getpid()}")
     p.add_argument("--out", help="抽帧存哪（不给就不存）")
+    p.add_argument("--save-every", type=int, default=25,
+                   help="每几帧存一张。想拼成片就给 1")
     p.add_argument("--join-timeout", type=float, default=60.0)
     p.add_argument("--drain", type=float, default=5.0, help="推完音频再收几秒")
     p.add_argument("--max-first-frame", type=float, default=3.0)
