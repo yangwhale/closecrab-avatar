@@ -120,6 +120,27 @@ async def test_frames_are_emitted_as_video_frames():
     assert (got[0].width, got[0].height) == src.size
 
 
+@pytest.mark.asyncio
+async def test_generator_does_not_pace_frames():
+    """⭐ **这一层不做帧率节流**，攒了多少一次吐多少。
+
+    下游 `AVSynchronizer` 自带 `_FPSController`。两道闸串起来每帧付两次
+    间隔，吞吐对半砍 —— 实测 25 fps 的目标只跑出 10 fps，看起来像 GPU
+    不够，其实是自己多排了一道节奏。
+
+    判据：一整块 12 帧要在**远小于 12/fps（0.48 s）**的时间里吐完。
+    """
+    src, gen = make()
+    for _ in range(12):
+        src.emit()
+    t0 = asyncio.get_running_loop().time()
+    got = await drain(gen, 12, timeout=2.0)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert len(got) == 12, f"只吐出 {len(got)} 帧"
+    assert elapsed < 12 / G.fps / 2, \
+        f"吐 12 帧花了 {elapsed:.3f}s —— 这一层还在按帧率节流"
+
+
 # ── ⭐ 打断 ───────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

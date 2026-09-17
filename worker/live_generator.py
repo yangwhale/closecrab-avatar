@@ -124,22 +124,31 @@ class LiveAvatarGenerator(VideoGenerator):
     # ── 出 ────────────────────────────────────────────────────────
 
     async def __aiter__(self) -> AsyncIterator[AVOut]:
-        interval = 1.0 / self._geom.fps
-        loop = asyncio.get_running_loop()
-        next_at = loop.time()
+        """有多少吐多少。**这里不做帧率节流。**
+
+        ⚠️ 踩过：原来这里按 `1/fps` 自己排了一遍节奏。但下游
+        `AVSynchronizer` 自带 `_FPSController(expected_fps=video_fps)` ——
+        两道闸串在一起，每帧要付两次 40 ms，吞吐直接对半砍。
+        实测 25 fps 的目标只跑出 10 fps，看起来像 GPU 不够。
+
+        > 跟音频分块那次是同一个错：**自己实现调度之前，先看被调用方
+        > 是不是已经在调度。** 它 `async for` 逐帧拉，节奏就归它管。
+
+        没帧的时候短睡一下，别空转 —— 这是「让出 CPU」不是「排节奏」，
+        所以取一个远小于帧间隔的值。
+        """
+        idle = 1.0 / (self._geom.fps * 4)
         while True:
             # 音频优先、有多少发多少：它不能等视频。
+            sent = False
             while not self._audio_out.empty():
                 yield self._audio_out.get_nowait()
-            img = self._src.next_frame()
-            if img is not None:
+                sent = True
+            while (img := self._src.next_frame()) is not None:
                 yield to_video_frame(img)
-            next_at += interval
-            delay = next_at - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            else:
-                next_at = loop.time()      # 落后就重新对齐，不追债
+                sent = True
+            if not sent:
+                await asyncio.sleep(idle)
 
 
 def to_video_frame(img: np.ndarray) -> rtc.VideoFrame:
