@@ -57,8 +57,8 @@ class BucketGeometry:
     """把上游那套桶几何抄成可计算的形状。默认值即生产值，出处见模块注释。"""
 
     video_rate: int = 30
-    fps: int = 16
-    infer_frames: int = 80
+    fps: int = 25
+    infer_frames: int = 48
     audio_sample_m: int = 0
 
     def __post_init__(self) -> None:
@@ -153,7 +153,18 @@ class BucketGeometry:
             raise ValueError("audio_frame_num 不能为负")
         if audio_frame_num == 0:
             return 0          # 一点音频都没有就别转 —— 上游在这里会给 1 轮纯静音
-        return max(1, math.ceil(audio_frame_num / self.frames_per_repeat))
+
+        # ⚠️ **用整数算，不能 `ceil(N / frames_per_repeat)`。**
+        #
+        # `frames_per_repeat = 48 * 30 / 25` 在浮点里是 **57.599999999999994**，
+        # 于是 `288 / 57.599999999999994 = 5.0000000000000005`，`ceil` 给 6 ——
+        # 多转一整轮纯静音，**正是这个 ceil 本来要避免的那件事**。
+        # 而且只在「刚好整除」时发作，平时完全看不出来。
+        #
+        # 等价的整数形式：ceil(N·fps / (infer_frames·video_rate))
+        num = audio_frame_num * self.fps
+        den = self.infer_frames * self.video_rate
+        return max(1, -(-num // den))
 
     def upstream_num_repeat(self, audio_frame_num: int) -> int:
         """**照抄**上游 `min_batch_num`，只用来对拍，不参与调度。

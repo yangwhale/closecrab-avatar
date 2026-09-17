@@ -103,15 +103,15 @@ async def test_segment_end_forwarded():
 
 @pytest.mark.asyncio
 async def test_renders_only_when_a_full_repeat_is_ready():
-    """一轮要 149 个嵌入帧（≈4.97 s）。差一点都不能开 ——
+    """一轮要 57 个嵌入帧（=1.9 s）。差一点都不能开 ——
     开了就得拿裁剪值凑，口型会跟声音错开，而且不报错。
     """
     src, gen = make()
-    await gen.push_audio(pcm_frame(4.0))          # 120 帧，不够
+    await gen.push_audio(pcm_frame(1.5))          # 45 帧，不够
     await asyncio.sleep(0.05)
     assert src.calls == 0, "不够一轮就渲了"
 
-    await gen.push_audio(pcm_frame(1.5))          # 累计 165 帧，够了
+    await gen.push_audio(pcm_frame(1.0))          # 累计 75 帧，够了
     await asyncio.sleep(0.15)
     assert src.calls == 1, f"够了却没渲（calls={src.calls}）"
 
@@ -201,7 +201,7 @@ async def test_interrupt_resets_the_repeat_counter():
     取到的是**越界或者别人的**嵌入帧，口型跟内容完全对不上。
     """
     src, gen = make()
-    await gen.push_audio(pcm_frame(11.0))         # 两轮
+    await gen.push_audio(pcm_frame(4.5))          # 两轮（一轮 1.92 s）
     await asyncio.sleep(0.3)
     assert gen._emitted_repeats >= 1
     gen.clear_buffer()

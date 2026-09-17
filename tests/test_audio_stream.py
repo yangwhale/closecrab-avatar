@@ -22,27 +22,31 @@ G = BucketGeometry()          # 默认即生产值
 # ── 先把常数钉住：它们全是从上游源码抄的，改了要有人知道 ────────────────
 
 def test_constants_match_upstream():
-    assert (G.video_rate, G.fps, G.infer_frames, G.audio_sample_m) == (30, 16, 80, 0)
-    assert G.scale == 30 / 16 == 1.875
-    assert G.frames_per_repeat == 150
+    assert (G.video_rate, G.fps, G.infer_frames, G.audio_sample_m) == (30, 25, 48, 0)
+    assert G.scale == 30 / 25 == 1.2
+    assert G.frames_per_repeat == 48 * 1.2
 
 
-def test_external_anchor_five_seconds_in_five_seconds_out():
+def test_external_anchor_audio_seconds_equal_video_seconds():
     """⭐ 外部锚点：一轮吃的音频时长 == 一轮出的视频时长。
 
-    音频侧 150 帧 ÷ 30 Hz = 5 s；视频侧 80 帧 ÷ 16 fps = 5 s。
+    音频侧 57.6 帧 ÷ 30 Hz = 1.92 s；视频侧 48 帧 ÷ 25 fps = 1.92 s。
     这两个数走的是完全不同的公式，能对上说明整套几何没算歪。
     **孤立的数字最危险，这一条就是它的解药。**
+
+    2026-09-17 它真的救了一次：我把 fps 写成 16（拿错了配置树），
+    常数全错，但这条断言的**形式**不变 —— 换成正确的 25 之后它照样成立。
     """
     audio_seconds = G.frames_per_repeat / G.video_rate
     video_seconds = G.infer_frames / G.fps
-    assert audio_seconds == video_seconds == 5.0
+    assert abs(audio_seconds - video_seconds) < 1e-9
+    assert abs(audio_seconds - 1.92) < 1e-9
 
 
 def test_stride_is_truncated_not_rounded():
     # 上游写的是 int(video_rate/fps) —— 30/16=1.875 截断成 1。
     # 改成 round 会变 2，m>0 时取的上下文窗口整个错位。
-    assert G.stride == 1
+    assert G.stride == 1          # int(30/25) = 1
     assert BucketGeometry(video_rate=30, fps=8).stride == 3
 
 
@@ -93,10 +97,9 @@ def test_slot_frame_does_not_depend_on_total_length():
 # ── 什么时候可以开一轮 ────────────────────────────────────────────────
 
 def test_frames_needed_for_first_repeat():
-    # 第 0 轮用槽位 0..79，最后一个取 round(79*1.875)=round(148.125)=148，
-    # 所以要 149 帧。**不是 150** —— 差这一帧就会白等 1/30 秒。
-    assert G.slot_frame(79) == 148
-    assert G.frames_needed_for_repeat(0) == 149
+    # 第 0 轮用槽位 0..47，最后一个取 round(47*1.2)=round(56.4)=56，所以要 57 帧。
+    assert G.slot_frame(47) == 56
+    assert G.frames_needed_for_repeat(0) == 57
 
 
 def test_frames_needed_is_strictly_increasing():
@@ -148,9 +151,23 @@ def test_deliberate_divergence_ceil_vs_plus_one():
     N 正好是一轮的整数倍时，上游多给一轮纯静音。直播里那是数字人
     对着空气动 5 秒嘴，所以我们用 ceil。差异是有意的。
     """
-    assert G.upstream_num_repeat(150) == 2          # 上游：第 2 轮全是零填充
-    assert G.repeats_for_finished_stream(150) == 1  # 我们：到此为止
-    assert G.repeats_for_finished_stream(151) == 2  # 多一帧就真的要第 2 轮
+    # 288 帧 = 正好 5 轮（288·25 / (48·30) = 5）
+    assert G.upstream_num_repeat(288) == 6          # 上游：第 6 轮全是零填充
+    assert G.repeats_for_finished_stream(288) == 5  # 我们：到此为止
+    assert G.repeats_for_finished_stream(289) == 6  # 多一帧就真的要第 6 轮
+
+
+def test_exact_multiple_is_not_broken_by_float_error():
+    """⭐ `frames_per_repeat` 浮点是 57.599999999999994。
+
+    `ceil(288 / 57.599999999999994)` = 6，**多一整轮纯静音** —— 正是这个
+    ceil 本来要避免的那件事。只在刚好整除时发作，平时完全看不出来。
+    所以内部必须用整数：ceil(N·fps / (infer_frames·video_rate))。
+    """
+    assert G.frames_per_repeat != 57.6, "浮点误差前提没了，这条测试要重写"
+    for k in range(1, 8):
+        n = k * G.infer_frames * G.video_rate // G.fps      # 恰好 k 轮
+        assert G.repeats_for_finished_stream(n) == k, f"{n} 帧应是 {k} 轮"
 
 
 @pytest.mark.parametrize("n", [1, 2, 149, 150, 151, 299, 300, 301, 1000, 4501])
@@ -247,7 +264,7 @@ def test_gather_takes_the_right_frames():
     assert out.shape == (1, G.infer_frames, 4)
     # 第 0 个槽位取第 0 帧（值 1），第 79 个取第 148 帧（值 149）
     assert out[0, 0, 0] == 1
-    assert out[0, 79, 0] == 149 == G.slot_frame(79) + 1
+    assert out[0, 47, 0] == 57 == G.slot_frame(47) + 1
 
 
 def test_gather_zero_fills_past_the_end():
@@ -278,4 +295,4 @@ def test_gather_does_not_clamp_to_the_last_frame():
 def test_gather_second_repeat_offsets_correctly():
     from worker.audio_stream import gather_slots
     out = gather_slots(_embed(400), 1, G)
-    assert out[0, 0, 0] == G.slot_frame(G.infer_frames) + 1 == 151
+    assert out[0, 0, 0] == G.slot_frame(G.infer_frames) + 1 == 59

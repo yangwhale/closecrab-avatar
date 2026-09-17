@@ -112,10 +112,25 @@ say "装 requirements"
 # 「Failed to import ... look up to see its traceback」把真凶藏在上面。
 "$VENV/bin/pip" uninstall -y -q deepspeed 2>/dev/null || true
 
-say "装 flash_attn_3（wheel 是 cu128torch280 版，跟上面钉的 torch 对齐）"
-"$VENV/bin/pip" install -q flash_attn_3 \
-    --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch280 || \
-    say "⚠️ flash_attn_3 没装上，注意力会退回较慢的后端"
+# ⚠️⚠️ **B200 上装 FlashAttention 3 会让整个推理崩掉。**
+#
+# 上游 README 推荐的 FA3 wheel 是给 **Hopper（H800/H200，sm_90）** 编的。
+# B200 是 **Blackwell（sm_100）**，里面没有这张卡的机器码。表现是：
+#
+#   pip 装得上 → `import flash_attn_3` 成功 → 一跑推理五个 rank 一起炸
+#   CUDA error (.../flash-attention/hopper/flash_fwd_launch_template.h:165):
+#   no kernel image is available for execution on the device
+#
+# **「import 成功」只证明有 Python 包，不证明有你这张卡的机器码。**
+# 这是今天第三次「装得上 ≠ 能用」（另两次见上面两段注释）。
+#
+# 这条坑 PERF-B200.md 早就写了，装 FA2 2.8.3。而且主干 attention 本来就走
+# cuDNN（`cudnn_require()` 默认恒为真），FA 几乎不进热路径 —— 所以装不上
+# 也只是少一条可选后端，不影响正确性。
+say "卸掉 FA3（Hopper 版，B200 上跑必崩）、装 FA2"
+"$VENV/bin/pip" uninstall -y -q flash_attn_3 2>/dev/null || true
+"$VENV/bin/pip" install -q flash-attn==2.8.3 --no-build-isolation 2>/dev/null || \
+    say "⚠️ FA2 没装上 —— 不致命，attention 走 cuDNN"
 
 say "装 worker 侧要的 LiveKit"
 "$VENV/bin/pip" install -q "livekit-agents>=1.5" livekit aiohttp pillow
@@ -125,7 +140,9 @@ say "装 worker 侧要的 LiveKit"
 "$VENV/bin/python" - <<'VERIFY' || { say "❌ 环境核验没过，别往下走"; exit 1; }
 import importlib, sys
 bad = []
-for m in ("torch","transformers","peft","diffusers","flash_attn_3",
+# 注意：flash_attn 不在必查列表里 —— 它是可选后端（主干走 cuDNN），
+# 而且**能 import 不代表有本卡的 kernel**，查了也不说明问题。
+for m in ("torch","transformers","peft","diffusers",
           "librosa","onnxruntime","livekit.agents"):
     try:
         importlib.import_module(m)
