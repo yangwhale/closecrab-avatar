@@ -20,6 +20,10 @@ class Settings:
     # ── 状态库。默认 SQLite，单实例控制面足够；换 Postgres 只要改这一个 URL。
     db_path: str = "/var/lib/liveavatar-gateway/state.db"
 
+    # ── 形象库。每个房间一张参考图，worker 重开生成循环时按 room 取。
+    #    跟状态库放一块儿（同一个 ReadWritePaths），备份也就一起带走了。
+    persona_dir: str = "/var/lib/closecrab-avatar/personas"
+
     # ── 会话生命周期
     #    idle_timeout 是必须项不是加分项：客户端跑掉而不调 terminate 的话，
     #    槽位会永久泄漏，8 张卡漏一张就少一路。
@@ -47,6 +51,7 @@ class Settings:
             livekit_api_key=key,
             livekit_api_secret=secret,
             db_path=os.environ.get("LA_GATEWAY_DB", cls.db_path),
+            persona_dir=os.environ.get("LA_PERSONA_DIR", cls.persona_dir),
             idle_timeout_s=_int("LA_IDLE_TIMEOUT_S", cls.idle_timeout_s),
             max_session_s=_int("LA_MAX_SESSION_S", cls.max_session_s),
             worker_heartbeat_timeout_s=_int("LA_WORKER_HB_TIMEOUT_S", cls.worker_heartbeat_timeout_s),

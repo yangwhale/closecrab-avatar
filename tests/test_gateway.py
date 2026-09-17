@@ -211,3 +211,72 @@ def test_still_sweeps_a_busy_worker(tmp_path):
     _t.sleep(0.08)
     assert sched.sweep_dead_workers() == ["busy-gpu"]
     assert sched.capacity().used == 0, "会话没被关掉，槽位仍被占着"
+
+
+# ── 形象库端点 ────────────────────────────────────────────────────
+
+def _client(tmp_path):
+    """起一个真的 FastAPI 应用，走 HTTP 层。
+
+    上面那些测试是单元级的（直接调函数）；形象库这几条必须走 HTTP ——
+    要验的恰恰是**路由层**的东西：原始字节怎么进来、错误落成哪个状态码、
+    ETag 有没有带上。绕过路由就等于没测。
+    """
+    from fastapi.testclient import TestClient
+
+    from closecrab_avatar.app import create_app
+    from closecrab_avatar.config import Settings
+
+    settings = Settings(
+        livekit_api_key="devkey", livekit_api_secret="d" * 32,
+        db_path=":memory:", persona_dir=str(tmp_path / "personas"))
+    app = create_app(settings, RING)
+    return TestClient(app), {"Authorization": f"Bearer {sign_client_token('k1', KEY.secret)}"}
+
+
+JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+
+
+def test_persona_upload_get_and_image(tmp_path, monkeypatch):
+    """三个端点串一遍：传 → 问元数据 → 取图。"""
+    c, auth = _client(tmp_path)
+    assert c.get("/avatar/persona/bunny", headers=auth).status_code == 404
+
+    r = c.put("/avatar/persona/bunny", content=JPEG_BYTES, headers=auth)
+    assert r.status_code == 200, r.text
+    ver = r.json()["version"]
+
+    m = c.get("/avatar/persona/bunny", headers=auth)
+    assert m.status_code == 200 and m.json()["version"] == ver
+
+    img = c.get("/avatar/persona/bunny/image", headers=auth)
+    assert img.status_code == 200
+    assert img.content == JPEG_BYTES
+    assert img.headers["content-type"].startswith("image/jpeg")
+    # ETag 是 worker 判断「要不要重开循环」的依据，不能丢。
+    assert ver in img.headers.get("etag", "")
+
+
+def test_persona_rejects_non_image(tmp_path):
+    """⭐ 400 不是 500 —— 是调用方给错了东西，不是我们坏了。"""
+    c, auth = _client(tmp_path)
+    r = c.put("/avatar/persona/bunny", content=b"<html>nope</html>", headers=auth)
+    assert r.status_code == 400 and "认不出" in r.text
+
+
+def test_persona_rejects_empty_body(tmp_path):
+    c, auth = _client(tmp_path)
+    assert c.put("/avatar/persona/bunny", content=b"", headers=auth).status_code == 400
+
+
+def test_persona_rejects_path_traversal(tmp_path):
+    """⭐ 房间名进了文件路径，`..` 必须被挡在 400。"""
+    c, auth = _client(tmp_path)
+    r = c.put("/avatar/persona/..%2F..%2Fetc%2Fpasswd", content=JPEG_BYTES, headers=auth)
+    assert r.status_code in (400, 404), r.status_code
+
+
+def test_persona_needs_auth(tmp_path):
+    c, _ = _client(tmp_path)
+    assert c.put("/avatar/persona/bunny", content=JPEG_BYTES).status_code == 401
+    assert c.get("/avatar/persona/bunny/image").status_code == 401

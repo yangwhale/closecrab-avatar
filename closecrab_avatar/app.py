@@ -17,12 +17,13 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from .auth import ApiKey, AuthError, KeyRing, make_terminate_token, verify_bearer, verify_terminate_token
 from .config import Settings
 from .lk_token import mint_worker_token
+from .persona import PersonaError, PersonaStore
 from .scheduler import NoCapacity, Scheduler
 from .store import Session, Store
 
@@ -63,6 +64,7 @@ class WorkerRegister(BaseModel):
 def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
     store = Store(settings.db_path)
     sched = Scheduler(store, heartbeat_timeout_s=settings.worker_heartbeat_timeout_s)
+    personas = PersonaStore(settings.persona_dir)
 
     async def _reaper() -> None:
         while True:
@@ -181,12 +183,69 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
         log.info("会话 %s 已终止", body.provider_session_id)
         return {"status": "terminated"}
 
+    # ── 形象库：这个房间现在用哪张脸 ────────────────────────────
+    #
+    # 参考图原来是 worker 的命令行参数，写死在进程里 —— 换一张要重启五卡，
+    # 而且外面看不到当前用的是哪张。这三个端点把它变成可读可写的。
+    #
+    # ⚠️ 上传走**原始字节**不走 multipart：客户端（iOS / 我的脚本 / curl）
+    #    都只是发一张图，multipart 只是多一层编解码和一个容易搞错的边界。
+
+    @app.put("/avatar/persona/{room}")
+    async def put_persona(room: str, request: Request,
+                          note: str = "",
+                          api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "请求体是空的 —— 图片要放在 body 里发原始字节")
+        try:
+            p = personas.put(room, data, note=note)
+        except PersonaError as e:
+            # 400 不是 500：这是调用方给错了东西，不是我们坏了。
+            raise HTTPException(400, str(e)) from e
+        return {"status": "ok", **p.to_json()}
+
+    @app.get("/avatar/persona/{room}")
+    async def get_persona(room: str, api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
+        try:
+            p = personas.get(room)
+        except PersonaError as e:
+            raise HTTPException(400, str(e)) from e
+        if p is None:
+            # **404 而不是空对象** —— 「没设置过」和「设置成空」是两件事，
+            # 客户端要据此决定显示默认脸还是显示上传过的那张。
+            raise HTTPException(404, f"房间 {room} 还没设过形象图")
+        return p.to_json()
+
+    @app.get("/avatar/persona/{room}/image")
+    async def get_persona_image(room: str, api_key: ApiKey = Depends(auth)) -> Response:
+        try:
+            got = personas.read_image(room)
+        except PersonaError as e:
+            raise HTTPException(400, str(e)) from e
+        if got is None:
+            raise HTTPException(404, f"房间 {room} 还没设过形象图")
+        data, ctype = got
+        meta = personas.get(room)
+        # 带上版本当 ETag：客户端和 worker 都靠它判断「要不要重新拉」。
+        headers = {"ETag": f'"{meta.version}"'} if meta else {}
+        return Response(content=data, media_type=ctype, headers=headers)
+
+    @app.delete("/avatar/persona/{room}")
+    async def del_persona(room: str, api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
+        try:
+            existed = personas.delete(room)
+        except PersonaError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"status": "deleted" if existed else "nothing-to-delete"}
+
     # ── 运维 ──────────────────────────────────────────────────
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         cap = sched.capacity()
         return {"status": "ok", "slots_total": cap.total, "slots_used": cap.used,
-                "slots_free": cap.free, "keys": len(ring)}
+                "slots_free": cap.free, "keys": len(ring),
+                "personas": personas.rooms()}
 
     # ── 内部：worker 注册与长轮询（不对外暴露）──────────────────
     @app.post("/internal/workers/register")
