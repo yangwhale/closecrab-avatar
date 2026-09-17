@@ -53,6 +53,7 @@ class CloseCrabAvatar:
 
     def __init__(self, *, gateway_url: str, key_id: str, secret: str,
                  livekit_url: str,
+                 livekit_api_key: str = "", livekit_api_secret: str = "",
                  avatar_identity: str = DEFAULT_AVATAR_IDENTITY,
                  avatar_name: str = "CloseCrab Avatar",
                  sample_rate: int = 16000,
@@ -63,6 +64,8 @@ class CloseCrabAvatar:
         self._key_id = key_id
         self._secret = secret
         self._livekit_url = livekit_url
+        self._lk_key = livekit_api_key
+        self._lk_secret = livekit_api_secret
         self._identity = avatar_identity
         self._name = avatar_name
         self._sample_rate = sample_rate
@@ -165,11 +168,20 @@ class CloseCrabAvatar:
         """
         import aiohttp
 
+        room = self._room
         if self._agent_session is not None:
             try:
                 self._agent_session.output.audio = self._prev_audio_out
             except Exception:                       # noqa: BLE001
                 log.warning("音频出口没还回去 —— agent 可能会哑", exc_info=True)
+
+        # ⭐ **把数字人踢出房间。** 只跟控制面说一声是不够的 —— worker 那头在等
+        #    agent 离开，控制面结不结账它根本不知道，于是它就一直站在房间里。
+        #    实测过：agent 日志一路 on → off、会话也终止了，房间里那个
+        #    `cc-avatar` 纹丝不动，客户端还看着一张不动的脸。
+        #    （上游 `AvatarSession.aclose()` 本来就有这一步，我们是鸭子类型
+        #    实现，没继承到，得自己补。）
+        await self._evict(room)
 
         sid, tok = self._session_id, self._terminate_token
         self._session_id = self._terminate_token = None
@@ -214,6 +226,42 @@ class CloseCrabAvatar:
         agent_session.output.audio = DataStreamAudioOutput(
             self._room, destination_identity=self._identity,
             sample_rate=self._sample_rate)
+
+
+    async def _evict(self, room: Any) -> None:
+        """把数字人从房间里请出去。踢掉之后 worker 那边会收到
+        `disconnected`，自己收摊。
+
+        优先用 job context 里那个 api client（agent 运行时都有），
+        没有再用显式凭据。两个都没有就明说 —— **不要静默跳过**，
+        跳过的后果是房间里留一个不动的人，比报错难查得多。
+        """
+        from livekit import api
+
+        if room is None:
+            return
+        req = api.RoomParticipantIdentity(room=room.name, identity=self._identity)
+        try:
+            from livekit.agents import get_job_context
+
+            ctx = get_job_context(required=False)
+        except Exception:                           # noqa: BLE001
+            ctx = None
+
+        if ctx is not None:
+            await ctx.api.room.remove_participant(req)
+            return
+        if not (self._lk_key and self._lk_secret):
+            log.warning("踢不掉数字人：既不在 job context 里，也没给 LiveKit 凭据。"
+                        "房间里会留一个不动的人")
+            return
+        lk = api.LiveKitAPI(self._livekit_url.replace("ws://", "http://")
+                            .replace("wss://", "https://"),
+                            self._lk_key, self._lk_secret)
+        try:
+            await lk.room.remove_participant(req)
+        finally:
+            await lk.aclose()
 
 
 async def _room_sid(room: Any) -> str:
