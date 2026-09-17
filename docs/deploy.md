@@ -45,6 +45,29 @@ sudo systemctl enable --now closecrab-avatar-worker@0
 
 装完两边都跑一次 `./scripts/install.sh --check`。
 
+## 五卡流式怎么起（跟一卡一路不是一个形状）
+
+⚠️ **五卡流式不是「一进程一张卡」。** 它是 `torchrun --nproc_per_node=5`
+拉起的一组 5 个进程：
+
+| rank | 干什么 |
+|---|---|
+| 0–3 | DiT，纯算，不碰 LiveKit |
+| **4** | VAE —— **只有它**拉音频、出帧，LiveKit 那一头全在这个 rank 上 |
+
+所以 systemd 那边是**一组一个 unit**，不是一卡一个；一台 8 卡机器跑五卡流式
+= **1 组**（剩 3 张闲着）。要 8 路并发就走一卡一路，但**单卡那条没有流式出帧**
+（`causal_s2v_pipeline` 里一个 `yield` 都没有）。取舍见
+[benchmarks.md 第一节](benchmarks.md#一先选路你要并发还是单路画质)。
+
+```bash
+# 一组五卡（卡 0-4）
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 \
+  ~/LiveAvatar/.venv/bin/torchrun --nproc_per_node=5 --master_port=29103 \
+  -m worker.runner --gateway http://<控制面>:8080 \
+  --worker-id $(hostname)-tpp0 --capacity 1
+```
+
 ## 必须配的两个超时
 
 | 参数 | 默认 | 为什么不能不配 |

@@ -210,9 +210,13 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload
-    say "✅ worker 环境就绪。一卡一个进程，按卡号启用："
-    say "     sudo systemctl enable --now closecrab-avatar-worker@0"
-    say "     （8 张卡就 @0 … @7）"
+    say "✅ worker 环境就绪。"
+    say ""
+    say "   下一步要先选路（见 docs/benchmarks.md 第一节）："
+    say "   · 多路并发 —— 一卡一进程，8 卡 = 8 路："
+    say "       sudo systemctl enable --now closecrab-avatar-worker@0   # …@7"
+    say "   · 单路流式 —— 五卡一组（4 DiT + 1 VAE），8 卡机只能开 1 组："
+    say "       见 docs/deploy.md「五卡流式怎么起」"
 }
 
 case "$ROLE" in
