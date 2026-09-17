@@ -70,13 +70,13 @@ class LiveAvatarPipelineSource:
 
     def __init__(self, *, ref_image_path: str, prompt: str,
                  ckpt_dir: str, training_config: str,
-                 warmup_audio: str,
+                 warmup_audio: str, lora_path: str = "",
                  size: str = "720*400", infer_frames: int = 48,
                  task: str = "s2v-14B", seed: int = 420,
                  use_fp8: bool = True, num_gpus_dit: int = 4):
         self._cfg = dict(ref_image_path=ref_image_path, prompt=prompt,
                          ckpt_dir=ckpt_dir, training_config=training_config,
-                         warmup_audio=warmup_audio, size=size,
+                         warmup_audio=warmup_audio, lora_path=lora_path, size=size,
                          infer_frames=infer_frames, task=task, seed=seed,
                          use_fp8=use_fp8, num_gpus_dit=num_gpus_dit)
         self._pipe = None
@@ -175,7 +175,11 @@ class LiveAvatarPipelineSource:
         #    4 步蒸馏（sampling_steps=4 / guide_scale=0）全靠这个 DMD LoRA；
         #    不加载的话模型照样跑、照样出画面，只是 4 步下画质稀烂 ——
         #    典型的「看起来在工作」的失效。
-        lora = ts.get("pretrained_lora_path") or "Quark-Vision/Live-Avatar"
+        # ⚠️ 传 HF repo id 的话上游会 `hf_hub_download(cache_dir="ckpt/LiveAvatar")`
+        #    —— **相对 CWD**。worker 的 CWD 不是 LiveAvatar 目录，于是每台机器
+        #    每次都重下一份 1.35 GB 到别的地方。给绝对路径就走本地分支。
+        lora = (self._cfg["lora_path"] or ts.get("pretrained_lora_path")
+                or "Quark-Vision/Live-Avatar")
         pipe.noise_model = pipe.add_lora_to_model(
             pipe.noise_model,
             lora_rank=ts["lora_rank"], lora_alpha=ts["lora_alpha"],

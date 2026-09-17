@@ -246,6 +246,10 @@ def main() -> int:
     ap.add_argument("--warmup-audio", default=os.environ.get(
         "LA_WARMUP_AUDIO",
         os.path.expanduser("~/LiveAvatar/examples/dwarven_blacksmith.wav")))
+    # LoRA 本地权重。**给绝对路径**，否则上游按 CWD 重下一份 1.35 GB。
+    ap.add_argument("--lora-path", default=os.environ.get(
+        "LA_LORA_PATH",
+        os.path.expanduser("~/LiveAvatar/ckpt/LiveAvatar/liveavatar.safetensors")))
     ap.add_argument("--size", default=os.environ.get("LA_SIZE", "720*400"))
     ap.add_argument("--infer-frames", type=int, default=int(os.environ.get("LA_INFER_FRAMES", "48")))
     ap.add_argument("--num-gpus-dit", type=int, default=4)
@@ -261,7 +265,7 @@ def main() -> int:
         source = LiveAvatarPipelineSource(
             ref_image_path=a.image, prompt=a.prompt,
             ckpt_dir=a.ckpt_dir, training_config=a.training_config,
-            warmup_audio=a.warmup_audio, size=a.size,
+            warmup_audio=a.warmup_audio, lora_path=a.lora_path, size=a.size,
             infer_frames=a.infer_frames, num_gpus_dit=a.num_gpus_dit,
         )
         # 开机就装，不拖到第一句话 —— 否则第一个用户等三分钟。

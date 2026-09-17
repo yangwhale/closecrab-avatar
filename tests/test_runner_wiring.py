@@ -35,6 +35,7 @@ REQUIRED = {
     "warmup_audio": "--warmup-audio",
     "prompt": "--prompt",
     "size": "--size",
+    "lora_path": "--lora-path",
 }
 
 SOURCE_CLS = "LiveAvatarPipelineSource"
