@@ -105,6 +105,17 @@ class _Collector:
         self._dump_warned = False
 
     def attach(self, room: rtc.Room) -> None:
+        # ⚠️ **显式订阅，不要只靠 auto_subscribe。**
+        #    worker 那边 `_publish_track()` 里有一句
+        #    `await self._audio_publication.wait_for_subscription()` ——
+        #    没人订阅音频轨，它就**一直停在那**，视频轨永远发不出来。
+        #    表现是「数字人进房了但什么都没有」，看起来像模型挂了。
+        #    自动订阅在某些 SDK 版本 / 房间配置下不生效，而这一句代价为零。
+        @room.on("track_published")
+        def _(pub, participant):
+            if participant.identity == self.identity:
+                pub.set_subscribed(True)
+
         @room.on("track_subscribed")
         def _(track, pub, participant):
             if (track.kind == rtc.TrackKind.KIND_VIDEO
@@ -208,6 +219,37 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
     agent_room = rtc.Room()
     await agent_room.connect(a.livekit_url, tok)
 
+    # ⚠️ **假 agent 必须真发一条音轨，哪怕全是静音。**
+    #
+    #   worker 那边 `DataStreamAudioReceiver.start()` 调的是
+    #   `wait_for_participant(identity=agent_identity)`，而那个函数只认
+    #   **ACTIVE** 状态的参与者（`p.state == PARTICIPANT_STATE_ACTIVE`，
+    #   或者等 `participant_active` 事件）。一个轨都不发布的参与者在对端
+    #   SDK 眼里停在 JOINED，永远不会 active —— 于是 `runner.start()` 卡死在
+    #   第一步，音视频轨一个都发不出来。
+    #
+    #   生产上碰不到这一条，因为真 bot（`livekit_out`）本来就往房间里发音轨
+    #   （摘掉数字人时手机听的就是它）。**这个脚本原来比生产少做了一件事，
+    #   于是造出一个生产不存在的死锁。** 症状是「数字人进房了但一帧没有」，
+    #   跟模型没跑起来一模一样 —— 查了三轮才查到。
+    #   而且**光 publish 不够，要真有帧在流**：只发布不喂数据的话媒体协商
+    #   可能一直不落地，参与者照样不 active。所以起一条后台任务持续推静音，
+    #   就跟真 bot 不说话时那条麦克风轨一样。
+    silent = rtc.AudioSource(SAMPLE_RATE, 1)
+    await agent_room.local_participant.publish_track(
+        rtc.LocalAudioTrack.create_audio_track("e2e-agent-mic", silent),
+        rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+
+    async def _pump_silence() -> None:
+        n = SAMPLE_RATE // 50                      # 20 ms
+        buf = np.zeros(n, dtype=np.int16).tobytes()
+        while True:
+            await silent.capture_frame(rtc.AudioFrame(
+                data=buf, sample_rate=SAMPLE_RATE, num_channels=1,
+                samples_per_channel=n))
+
+    silence_task = asyncio.create_task(_pump_silence())
+
     # 3. 扮演观众进房，订阅数字人的视频轨
     vtok = (api.AccessToken(lk_key, lk_secret)
             .with_identity("e2e-viewer").with_name("E2E Viewer")
@@ -230,6 +272,34 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
     t_joined = time.monotonic()
     print(f"数字人已进房（{t_joined - t_created:.1f} s）")
 
+    # ⚠️ **进房 ≠ 能收音频。** `AvatarRunner.start()` 的顺序是
+    #    先 `audio_recv.start()`（挂上 `lk.audio_stream` 的回调）、
+    #    **再**发布音视频轨。进房那一刻这两件事都还没做。
+    #
+    #    这中间是几秒的窗口（要加载形象、reset 模型）。往里推音频的话，
+    #    LiveKit 只在 worker 日志里留一句
+    #    `ignoring byte stream with topic 'lk.audio_stream', no callback attached`
+    #    —— 不报错、不重试、这一段音频**直接丢掉**。脚本这头看到的是
+    #    「一帧都没收到」，跟「模型没跑起来」长得一模一样，会把人带去查模型。
+    #
+    #    所以等**视频轨发布**再推：那一步在 `audio_recv.start()` 之后，
+    #    看见它就等于接收端已经就位。用发布事件而不是 sleep —— 形象大小、
+    #    机器忙闲都会改变这段时间，猜一个秒数迟早会在别的机器上翻车。
+    async def _avatar_video_published() -> bool:
+        p = agent_room.remote_participants.get(avatar_identity)
+        return bool(p) and any(
+            pub.kind == rtc.TrackKind.KIND_VIDEO
+            for pub in p.track_publications.values())
+
+    deadline = time.monotonic() + a.join_timeout
+    while not await _avatar_video_published():
+        if time.monotonic() > deadline:
+            print(f"❌ 数字人进房了但 {a.join_timeout}s 内没发布视频轨 —— "
+                  f"`runner.start()` 卡住了，看 worker 日志")
+            return 1
+        await asyncio.sleep(0.2)
+    print(f"数字人已发布视频轨（再 {time.monotonic() - t_joined:.1f} s），开始推音频")
+
     # 4. 推音频。按实时速率推 —— **一次性灌进去量不出真实延迟**。
     out = DataStreamAudioOutput(agent_room, destination_identity=avatar_identity,
                                 sample_rate=SAMPLE_RATE)
@@ -246,6 +316,9 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
     await asyncio.sleep(a.drain)
 
     # 5. 结账
+    silence_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await silence_task
     await col.stop()
     await agent_room.disconnect()
     await viewer.disconnect()

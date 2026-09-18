@@ -212,7 +212,29 @@ class Worker:
                     audio_sample_rate=job.get("sample_rate", 16000), audio_channels=1,
                 ),
             )
-            await runner.start()
+            # ⚠️ **`runner.start()` 会无声地卡死，必须给它加一个超时和分步日志。**
+            #
+            #   它第一步是 `DataStreamAudioReceiver.start()` →
+            #   `wait_for_participant(identity=agent_identity)`，而那个函数只认
+            #   **ACTIVE** 状态。一个进了房但一直不 active 的 agent 会让它
+            #   永远等下去 —— 音视频轨一个都发不出来，控制面这边看到的是
+            #   「会话建了、worker 也进房了、就是没画面」，跟模型崩了长得一样。
+            #   卡住的那一路还占着槽位，直到 120 s 空闲回收才还。
+            #
+            #   所以宁可**快失败**：超时就抛出去，`finally` 那段会还槽位并
+            #   写清楚卡在哪一步。诊断信息比多等两分钟值钱。
+            start_grace = float(job.get("runner_start_grace_s", 30))
+            log.info("会话 %s：挂音频接收 + 发布音视频轨（上限 %.0f s）…",
+                     psid, start_grace)
+            try:
+                await asyncio.wait_for(runner.start(), timeout=start_grace)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"runner.start() 超过 {start_grace:.0f}s 没完成。"
+                    f"最常见的原因是 agent {job['agent_identity']!r} 进了房但一直不 "
+                    f"active —— 它得真发一条轨（生产上 bot 本来就发音轨），"
+                    f"光进房不发东西是不够的。") from None
+            log.info("会话 %s：音视频轨已发布，开始收音频", psid)
 
             # ⚠️ **不能只听 `disconnected`。** 那个事件只在**自己**被断开时触发，
             #    agent 走了我们照样连着 —— 于是一个人待在空房间里，心跳还
