@@ -57,6 +57,9 @@ log = logging.getLogger("closecrab.avatar.pipeline")
 # 因为数字人只有「现在」有意义，补播两秒前的嘴型比丢帧更糟。
 _FRAME_QUEUE_MAX = 64
 
+# 换脸（块边界上整组重开生成循环）。**默认关** —— 见 `_should_reload()` 顶部。
+_FACE_SWAP_ENABLED = os.environ.get("CCA_FACE_SWAP", "0") == "1"
+
 
 class LiveAvatarPipelineSource:
     """把上游 blockwise pipeline 包成 `FrameSource`。
@@ -282,6 +285,16 @@ class LiveAvatarPipelineSource:
         调一次」在五个 rank 上是对齐的。这条是这套协调能成立的前提，
         改上游版本时要重新确认。
         """
+        # ⚠️ **默认关掉。** 2026-09-18 上线这套之后 worker 零出帧 —— 会话建得起来、
+        #    视频轨也发了，但一帧都没生成，高度怀疑是这个每块一次的集合通信
+        #    在某个 rank 上对不齐、整组卡死（正是这套协调最怕的那种失效：
+        #    不报错，只是安静地停住）。
+        #
+        #    没查清之前先让它不生效 —— **能用的旧脸 >> 卡死的新脸**。
+        #    查清后设 `CCA_FACE_SWAP=1` 打开，或者去掉这个开关。
+        if not _FACE_SWAP_ENABLED:
+            return False
+
         import torch
         import torch.distributed as dist
 
