@@ -251,6 +251,18 @@ ATTR_WANT_BY_ROLE = {
 }
 """客户端写：这个角色要不要数字人。**一个角色一个键。**"""
 
+ATTR_STATE_BY_ROLE = {
+    AvatarRole.PRINCIPAL: "cc.avatar.state.principal",
+    AvatarRole.ASSISTANT: "cc.avatar.state.assistant",
+}
+"""**服务端写**，按角色回报。每一路写自己那个键，谁也盖不掉谁。
+
+老的 `ATTR_STATE` 是全房共享的一份，两路同时在的时候会互相覆盖 ——
+而覆盖的表现是「本体明明开着，客户端却显示 off」，看起来像开关失灵。
+所以新增按角色的键；老键仍然写，但**只有被分配到的那一路写**
+（理由见 `avatar_link` 里那段）。
+"""
+
 # ── ⭐ 一个角色一个数字人，不是「换主人」──────────────────────────
 #
 # Chris 2026-09-18：「Bunny 用 Bunny 的，语音助手用语音助手的。切换的时候是
@@ -287,13 +299,44 @@ def wanted_roles(per_participant: dict[str, dict[str, str]]) -> set[AvatarRole]:
 
     缺省 False：老客户端根本不发这些键，默认开的话每个连进来的旧客户端
     都会去抢一路 GPU，而它连显示的界面都没有。
+
+    ## ⚠️ 老客户端走兼容桥：只发 `cc.avatar.want` 的算「要本体」
+
+    三层（iOS / bot / 语音助手进程）不可能同一秒都升上去。装着旧 app 的人
+    只发老键，一个角色键都不发 —— 不桥接的话他的开关**从升级那一刻起
+    彻底失效**，而且没有任何报错。
+
+    桥接的判据是「**一个角色键都没有**」，不是「老键为真」：新客户端明确
+    把关掉的角色写成 `false`，那是一个表过态的 false，不能被老键盖回去。
+    分不清这两者的后果是：新客户端切到语音助手，老键跟着变 false 没问题；
+    但如果反过来按「老键为真就加本体」，用户在新 app 上关掉本体、
+    老键因为镜像逻辑还是 true 的那一瞬间，本体会被莫名其妙地拉起来。
     """
     out: set[AvatarRole] = set()
     for attrs in per_participant.values():
+        said_anything = False
         for role, key in ATTR_WANT_BY_ROLE.items():
+            if key in attrs:
+                said_anything = True
             if parse_flag(attrs.get(key), default=False):
                 out.add(role)
+        if not said_anything and parse_flag(attrs.get(ATTR_WANT), default=False):
+            out.add(AvatarRole.PRINCIPAL)
     return out
+
+
+def any_visible(per_participant: dict[str, dict[str, str]]) -> bool:
+    """屋里有没有人真的看得见。
+
+    跟 `wanted_roles()` 同一条聚合规则：**任何一个人看得见就算看得见**。
+    一条轨的成本是固定的，不能因为屋里有个人把手机扣下了就把别人的画面掐掉。
+
+    缺省 True —— 跟 `decide_from_attributes()` 里那条一致：一个明确要 avatar
+    却没报可见性的客户端（只实现了一半的版本），默认成不可见会让它**永远停在
+    hidden**，而且没有任何报错，纯粹「功能不工作」。
+    """
+    return any(parse_flag(a.get(ATTR_VISIBLE), default=True)
+               for a in per_participant.values())
 
 
 def allocate(wanted: set[AvatarRole], *, capacity: int = 1) -> list[AvatarRole]:

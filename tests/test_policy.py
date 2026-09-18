@@ -8,7 +8,18 @@ import pathlib
 import subprocess
 import sys
 
-SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "policy-contract.py"
+from closecrab_avatar.policy import (
+    ATTR_STATE,
+    ATTR_STATE_BY_ROLE,
+    ATTR_VISIBLE,
+    ATTR_WANT,
+    ATTR_WANT_BY_ROLE,
+    AvatarRole,
+    any_visible,
+    wanted_roles,
+)
+
+SCRIPT =pathlib.Path(__file__).resolve().parent.parent / "scripts" / "policy-contract.py"
 
 
 def test_policy_contract_holds():
@@ -82,3 +93,64 @@ def test_unknown_identity_returns_none_not_a_guess():
     from closecrab_avatar.policy import role_of_identity
     for bad in ("cc-avatar", "cc-avatar-", "cc-avatar-乱写", "someone-else", ""):
         assert role_of_identity(bad) is None
+
+
+# ── 老客户端兼容桥 ───────────────────────────────────────────────────
+
+
+def test_legacy_client_still_gets_principal():
+    """只发老键的旧 app 不能从升级那天起彻底失灵。"""
+    assert wanted_roles({"old": {ATTR_WANT: "true"}}) == {AvatarRole.PRINCIPAL}
+
+
+def test_legacy_off_wants_nothing():
+    assert wanted_roles({"old": {ATTR_WANT: "false"}}) == set()
+
+
+def test_explicit_false_is_not_overridden_by_legacy_key():
+    """⭐ 新客户端**表过态的 false** 不能被老键盖回去。
+
+    新 app 切到语音助手时写的是 principal=false + want=false；但升级窗口里
+    两个键的更新不保证同一条信令到达。按「老键为真就加本体」写的话，
+    中间那一瞬间本体会被莫名其妙拉起来 —— 一个自己会消失的幽灵。
+    """
+    attrs = {ATTR_WANT_BY_ROLE[AvatarRole.ASSISTANT]: "true",
+             ATTR_WANT_BY_ROLE[AvatarRole.PRINCIPAL]: "false",
+             ATTR_WANT: "true"}
+    assert wanted_roles({"new": attrs}) == {AvatarRole.ASSISTANT}
+
+
+def test_new_and_old_clients_coexist():
+    """一屋子里新旧客户端各要各的，两个都算数。"""
+    people = {"old": {ATTR_WANT: "true"},
+              "new": {ATTR_WANT_BY_ROLE[AvatarRole.ASSISTANT]: "true"}}
+    assert wanted_roles(people) == {AvatarRole.PRINCIPAL, AvatarRole.ASSISTANT}
+
+
+# ── 可见性聚合 ───────────────────────────────────────────────────────
+
+
+def test_any_visible_is_optimistic():
+    assert any_visible({"a": {ATTR_VISIBLE: "false"}, "b": {ATTR_VISIBLE: "true"}})
+
+
+def test_all_hidden_is_not_visible():
+    assert not any_visible({"a": {ATTR_VISIBLE: "false"}})
+
+
+def test_silent_client_counts_as_visible():
+    """没报可见性的默认看得见 —— 默认不可见会让它永远停在 hidden 且不报错。"""
+    assert any_visible({"a": {}})
+
+
+def test_empty_room_is_not_visible():
+    assert not any_visible({})
+
+
+# ── 按角色回报的状态键 ───────────────────────────────────────────────
+
+
+def test_each_role_reports_on_its_own_key():
+    keys = set(ATTR_STATE_BY_ROLE.values())
+    assert len(keys) == len(AvatarRole)
+    assert ATTR_STATE not in keys, "按角色的键不能跟老的全房键重名，否则照样互相覆盖"
