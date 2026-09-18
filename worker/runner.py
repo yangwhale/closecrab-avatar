@@ -177,6 +177,7 @@ class Worker:
         self._active.add(psid)
         room = rtc.Room()
         runner = None
+        gen = None            # 进房就可能抛，`finally` 里要收录制，先占上
         try:
             await room.connect(job["livekit_url"], job["room_token"])
             log.info("会话 %s 已进房 %s", psid, job["room_name"])
@@ -289,6 +290,16 @@ class Worker:
                     await runner.aclose()
                 except Exception:                    # noqa: BLE001
                     log.warning("会话 %s 关 runner 失败", psid, exc_info=True)
+            # 录制的粒度是**一场会话**，收尾点只有这一个（见
+            # `LiveAvatarGenerator.close_recording` 的说明）。不调的话
+            # 裸流照写、`meta.json` 永远不写，合成脚本合不出来 ——
+            # 而且全程没有任何异常，只有等你去合的时候才发现。
+            closer = getattr(gen, "close_recording", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:                    # noqa: BLE001
+                    log.warning("会话 %s 录制收尾失败", psid, exc_info=True)
             if self._source is not None:
                 # 人走了，别让没念完的音频喂给下一场
                 self._source.reset()

@@ -251,6 +251,26 @@ class LiveAvatarGenerator(VideoGenerator):
         self._audio_out_s = 0.0
         self._max_drift = 0.0
 
+    def close_recording(self) -> None:
+        """会话结束：把录制收尾，写出 `meta.json`。
+
+        ## 为什么单独一个方法，而不是挂在已有的钩子上
+
+        录制的粒度是**一场会话**，而这个类身上另外两个「结束」都是更细的粒度：
+
+            clear_buffer()      被打断 —— 后面还会接着说
+            AudioSegmentEnd     一句说完 —— 后面还会接着说
+
+        2026-09-18 挂在段落上，结果一场录了 0.5 秒就停了。改成只在打断/拆除时
+        关，**又把唯一的调用点弄没了** —— 于是文件照写、`meta.json` 永远不写，
+        而 `mux-av-dump.sh` 认准 `meta.json`（尺寸/帧率/采样率任一猜错，
+        合出来的东西照样能播、只是错的，整场判断作废）。
+
+        录了一堆裸流却合不出来，是个**沉默**的失败：日志里一行异常都没有。
+        所以现在有一个明确的、由 runner 在 `finally` 里调的收尾点。
+        """
+        self._dump.close()
+
     # ── 出 ────────────────────────────────────────────────────────
 
     async def __aiter__(self) -> AsyncIterator[AVOut]:
