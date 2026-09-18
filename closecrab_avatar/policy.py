@@ -209,3 +209,83 @@ def is_user_visible_problem(state: AvatarState) -> bool:
     （也就无所谓看不看得到提示），两个都报出来就是噪音。
     """
     return state is AvatarState.UNAVAILABLE
+
+
+# ── 数字人归谁：从「开/关」升级成「选一个角色」──────────────────────
+#
+# Chris 2026-09-18 定的新形态：
+#
+#   · 系统设置里那个全局开关**拿掉** —— 它不该是全局的
+#   · 房间里固定两个角色：语音助手、本体（bot 自己）
+#   · 在角色牌子上双击 = 把数字人给它；双击当前拿着的那个 = 关掉
+#   · **同一时刻只有一个角色能拿到数字人**（一条视频轨，全房共享）
+#   · 小屏幕标记画在当前拿着的那个牌子上，双击另一个就挪过去
+#
+# 开关只表达「想要」。真加不加得看服务端在不在（`service_ok`），
+# 这一点跟旧的 `decide()` 一致。
+#
+# ⚠️ **这一段是新契约，旧的 `ATTR_WANT` 暂时保留** —— 三层（iOS / bot /
+#    网关）不可能同一秒切换，中间必然有一段新旧并存。等三层都上了新的
+#    再删旧的，别现在就拆，那会造出一个「谁先部署谁就坏」的窗口。
+
+
+class AvatarTarget(str, Enum):
+    """数字人现在归谁。"""
+
+    OFF = "off"
+    """没人要。"""
+
+    ASSISTANT = "assistant"
+    """语音助手 —— 改道它的音频。"""
+
+    PRINCIPAL = "principal"
+    """本体（bot 自己的播报那一路）—— 改道它的音频。"""
+
+
+ATTR_TARGET = "cc.avatar.target"
+"""客户端写：数字人归谁（`off` / `assistant` / `principal`）。
+
+取代旧的布尔 `cc.avatar.want`。**角色名跟形象库那边是同一套**
+（`persona_role`），不要两处各起一套名字 —— 那样迟早对不上，
+而对不上的表现是「换了助手的图，兔子的脸变了」。
+"""
+
+
+def parse_target(raw: str | None) -> AvatarTarget:
+    """把属性解成目标。**认不出来一律当 OFF，不抛异常。**
+
+    不抛是因为这条路径在房间事件回调里：抛出去会让一次属性变更整个丢掉，
+    而客户端不会重发 —— 状态就永久卡住了。
+
+    认不出来当 OFF 而不是当「上一次那个」：陌生值多半来自版本不匹配的
+    客户端，让它**不占 GPU** 比让它继续占着安全。
+    """
+    try:
+        return AvatarTarget(str(raw or "").strip().lower())
+    except ValueError:
+        return AvatarTarget.OFF
+
+
+def target_for_room(per_participant: dict[str, dict[str, str]]) -> AvatarTarget:
+    """一屋子客户端合成**一个**目标。
+
+    数字人是一条视频轨、全房共享，所以只能有一个答案 —— 跟
+    `decide_for_room()` 同一个道理。
+
+    ## 冲突怎么办：谁都行，但**必须稳定**
+
+    两个人分别选了不同的角色时，结果不能取决于字典遍历顺序 ——
+    那会让画面在两个角色之间来回跳，而且复现不了。按参与者 identity
+    排序取第一个明确表态的：**任意但确定**。
+
+    > 这里刻意不做「后点的赢」：那需要时间戳，而属性变更没有可靠的顺序。
+    > 与其编一个假的优先级，不如给一个稳定的、能解释的结果。
+    """
+    picks = [
+        (ident, parse_target(attrs.get(ATTR_TARGET)))
+        for ident, attrs in sorted(per_participant.items())
+    ]
+    for _, t in picks:
+        if t is not AvatarTarget.OFF:
+            return t
+    return AvatarTarget.OFF
