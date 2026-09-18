@@ -57,8 +57,17 @@ log = logging.getLogger("closecrab.avatar.pipeline")
 # 因为数字人只有「现在」有意义，补播两秒前的嘴型比丢帧更糟。
 _FRAME_QUEUE_MAX = 64
 
-# 换脸（块边界上整组重开生成循环）。**默认关** —— 见 `_should_reload()` 顶部。
-_FACE_SWAP_ENABLED = os.environ.get("CCA_FACE_SWAP", "0") == "1"
+# 换脸请求落在这个文件里，五个 rank 都读它。见 `_run()` 里那段长注释。
+_FACE_FILE = os.environ.get("CCA_FACE_FILE", "/tmp/cca-current-face.txt")
+
+# 每多少块重开一次生成循环。**这个数必须五个 rank 完全一致** ——
+# 它就是那个「不用商量的共识」。走环境变量时五个 rank 由同一条命令拉起，
+# 天然一致；真要改成运行时可调，就得重新引入协调，得不偿失。
+#
+# 250 块 ≈ 2 分钟的**实际生成时间**（没人说话时循环是停住的，不计数）。
+# 取值权衡：太小 → 频繁重开，每次约 1 秒的卡顿；太大 → 换脸要等很久，
+# 而且长跑漂移也拉不回来。
+_RESTART_EVERY_BLOCKS = int(os.environ.get("CCA_RESTART_EVERY_BLOCKS", "250"))
 
 
 class LiveAvatarPipelineSource:
@@ -89,13 +98,8 @@ class LiveAvatarPipelineSource:
         self._thread: threading.Thread | None = None
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
-        # 换脸：VAE rank 记意愿，`_should_reload()` 广播给其余四个。
-        # 加锁是因为 `request_face()` 在**事件循环线程**上调，而读它的是模型线程。
-        self._face_lock = threading.Lock()
-        self._pending_face: str | None = None
         self._vae_rank = 0
-        # 换脸标志位专用的通信组，在 load() 里建。见那里的注释。
-        self._ctrl_group = None
+        self._restart_every = _RESTART_EVERY_BLOCKS
         self._frame_seq = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
@@ -229,40 +233,6 @@ class LiveAvatarPipelineSource:
             log.info("出帧尺寸 %d×%d（请求 %s，按 64 的网格取整）",
                      w, h, self._cfg["size"])
 
-        # ⭐⭐ **换脸的标志位走一个专用通信组，绝不能借默认组。**
-        #
-        # 上游 `generate()` 在默认组里本来就有一对**不对称**的 broadcast：
-        #   · DiT rank 在 `r==0 / r==1` 的轮次开头收（`rank != vae_rank` 分支）
-        #   · VAE rank 在 `r==0` 最后一个 block 发
-        # 也就是说同一个组里，不同 rank 在**完全不同的位置**发起集合通信，
-        # 全靠「每个组内按发起顺序配对」这条规则才对得上。
-        #
-        # 我再往这个组里插一个「每块一次」的 broadcast，就会跟上游那两个
-        # 抢着配对 —— 轻则读到别人的张量，重则整组死等。**而且不报错。**
-        #
-        # 建一个独立的组就把这整类风险切断了：两个组的配对各算各的。
-        # `new_group()` 必须**所有 rank 都调、且顺序一致** —— 放在 load() 里
-        # 正好满足（五个 rank 都会走到这儿，且只走一次）。
-        # ⚠️ **建组之前必须先把当前 CUDA 设备绑到本 rank。**
-        #    不绑的话每个进程的「当前设备」都是 cuda:0，NCCL 建组时会报
-        #      Duplicate GPU detected : rank 0 and rank 4 both on CUDA device ...
-        #      NCCL error ... invalid usage
-        #    然后打死一个 rank。实测就是这么挂的（2026-09-18）。
-        #
-        #    默认组之所以没事，是它在 `init_process_group()` 时建的 —— 那时
-        #    torchrun 刚设过 LOCAL_RANK 的设备上下文。**后建的组不继承那个前提。**
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-
-        # ⚠️ **建组失败不能把 worker 带走。** 这是一个可选功能的辅助设施，
-        #    它挂了最多是「换不了脸」，不该变成「整台机器不出画面」。
-        #    今天已经因为「一个开关把服务弄停了」返工过一次。
-        try:
-            self._ctrl_group = dist.new_group(ranks=list(range(world)))
-        except Exception:                                  # noqa: BLE001
-            self._ctrl_group = None
-            log.exception("换脸专用通信组建不起来 —— 换脸功能停用，其余照常")
-
         self._pipe = pipe
         log.info("rank %d/%d 模型就绪（%s）", rank, world,
                  "VAE：拉音频 + 出帧" if self._is_vae_rank else "DiT：纯算")
@@ -292,80 +262,36 @@ class LiveAvatarPipelineSource:
     # ── 模型线程 ──────────────────────────────────────────────────
 
     def request_face(self, path: str) -> None:
-        """换一张参考图。**不立刻生效** —— 下一个块边界上整组一起换。
+        """换一张参考图。**下一个重开边界生效**（最多等一个周期）。
 
-        只有拿到会话的那个 rank（VAE rank）会调这个方法；它把意愿记下来，
-        由 `_should_reload()` 广播给其余四个 rank。理由见那个方法。
+        只有 VAE rank 会调这个（会话在它手上）。它把路径写进一个所有 rank 都
+        读得到的文件 —— **不发任何集合通信**，理由见 `_run()`。
+
+        原子写（先写临时文件再 rename）：别的 rank 可能正好在读，
+        写一半被读到会得到一个不存在的路径。
         """
-        with self._face_lock:
-            if path and path != self._cfg["ref_image_path"]:
-                self._pending_face = path
-                log.info("收到换脸请求：%s（下一个块边界生效）", path)
+        if not path or path == self._cfg["ref_image_path"]:
+            return
+        try:
+            tmp = _FACE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(path)
+            os.replace(tmp, _FACE_FILE)
+        except OSError as e:
+            log.warning("写换脸请求失败（%s）—— 这次换不了，但不影响出画面", e)
+            return
+        log.info("换脸请求已落盘：%s（下一个重开边界生效）", path)
 
-    def _should_reload(self) -> bool:
-        """整组要不要在这里一起重开生成循环。**这是一次集合通信。**
-
-        ## 为什么必须广播，不能各自判断
-
-        参考图是在 `generate()` 开始那一刻传进去的，换脸 ＝ 重开那个循环。
-        而这个循环是五个 rank 一起跑的：DiT rank 在里面 `dist.send`，
-        VAE rank 在里面 `dist.recv`。**只要有一个 rank 提前跳出去，
-        剩下的就会永远堵在通信上** —— 不报错，整条流水线静默死掉。
-
-        「谁想换脸」这件事只有 VAE rank 知道（会话在它手上），所以由它
-        广播一个标志位。这里的关键是**每个 rank 每个块都调一次**，
-        调用点和次数完全一致，集合通信才不会错位。
-
-        ⚠️ 上游那个生成器在每个 rank 上都是**一个块 yield 一次**
-        （DiT rank `yield None`，VAE rank `yield image`），所以「每 yield 一次
-        调一次」在五个 rank 上是对齐的。这条是这套协调能成立的前提，
-        改上游版本时要重新确认。
-        """
-        # ⚠️ **默认关掉。** 2026-09-18 上线这套之后 worker 零出帧 —— 会话建得起来、
-        #    视频轨也发了，但一帧都没生成，高度怀疑是这个每块一次的集合通信
-        #    在某个 rank 上对不齐、整组卡死（正是这套协调最怕的那种失效：
-        #    不报错，只是安静地停住）。
-        #
-        #    没查清之前先让它不生效 —— **能用的旧脸 >> 卡死的新脸**。
-        #    查清后设 `CCA_FACE_SWAP=1` 打开，或者去掉这个开关。
-        if not _FACE_SWAP_ENABLED:
-            return False
-
-        import torch
-        import torch.distributed as dist
-
-        if not dist.is_initialized():
-            # 单卡跑（测试 / 退化模式）：没有别人要等，自己说了算。
-            with self._face_lock:
-                return self._pending_face is not None
-
-        if self._ctrl_group is None:
-            # 组还没建就别发集合通信 —— 借默认组正是这里要避免的事。
-            return False
-
-        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
-        if self._is_vae_rank:
-            with self._face_lock:
-                flag[0] = 1 if self._pending_face is not None else 0
-        # src 必须是 VAE rank 的全局 rank —— 它是唯一知道会话的那个。
-        dist.broadcast(flag, src=self._vae_rank, group=self._ctrl_group)
-        if int(flag[0]) == 0:
-            return False
-
-        # 换脸的路径本身也要广播：DiT rank 不知道图在哪，而 `generate()`
-        # 在每个 rank 上都要用到它（各自都会去读那张图）。
-        buf = torch.zeros(512, dtype=torch.uint8, device="cuda")
-        if self._is_vae_rank:
-            with self._face_lock:
-                raw = (self._pending_face or "").encode()[:512]
-            buf[:len(raw)] = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
-        dist.broadcast(buf, src=self._vae_rank, group=self._ctrl_group)
-        path = bytes(buf.cpu().numpy()).rstrip(b"\x00").decode(errors="replace")
-        if path:
+    def _adopt_pending_face(self) -> None:
+        """重开之前读一次换脸文件。**每个 rank 各读各的，不互相商量。**"""
+        try:
+            with open(_FACE_FILE, encoding="utf-8") as f:
+                path = f.read().strip()
+        except OSError:
+            return
+        if path and path != self._cfg["ref_image_path"] and os.path.exists(path):
+            log.info("换脸：%s → %s", self._cfg["ref_image_path"], path)
             self._cfg["ref_image_path"] = path
-        with self._face_lock:
-            self._pending_face = None
-        return True
 
     def _run(self) -> None:
         pipe = self._pipe
@@ -373,11 +299,36 @@ class LiveAvatarPipelineSource:
         #    DiT rank 装了也不会被调，装上无害、少一个分支。
         pipe.get_audio_callback = self.inbox.pull_block
 
-        # 外层这个 while 就是「换脸」：内层的 generate() 一旦跳出来，
-        # 就带着新的 ref_image_path 重开一轮。重开只重跑 Step 1（编码参考图 +
-        # VAE encode motion + 一次 barrier），**不重新加载模型权重** ——
-        # 所以是秒级，不是启动时那四分钟。
+        # ── 换脸：**按块计数确定性重开，不发任何集合通信** ──────────────
+        #
+        # 换脸 = 重开 `generate()`，而这个循环是五个 rank 咬合前进的：谁先跳
+        # 出去，剩下的永远堵在 `dist.recv` 上。所以「什么时候跳」必须五个 rank
+        # 一致。
+        #
+        # ⚠️ 试过两条更"聪明"的路，都不行，记下来省得再走：
+        #
+        #   1. **每块广播一个标志位（默认组）** —— 上游自己在默认组里就有一对
+        #      不对称的 broadcast（DiT rank 在轮次开头收、VAE rank 在块末尾发），
+        #      我插进去会跟它抢着配对。
+        #   2. **另建一个 `dist.new_group()`** —— NCCL 直接拒绝：
+        #      `Duplicate GPU detected : rank 0 and rank 4 both on CUDA device`，
+        #      先 `torch.cuda.set_device()` 也没用，而且它**不是可捕获的异常**，
+        #      直接打死一个 rank。
+        #
+        # 现在这版把「决定」和「内容」拆开，只有前者需要一致：
+        #
+        #   决定何时重开 → **纯块计数**，每个 rank 各数各的，天然一致，零通信
+        #   用哪张脸     → 读同一个文件，VAE rank 原子写
+        #
+        # 文件读可能正好撞上写（一个 rank 读到旧的、另一个读到新的），代价是
+        # **一个周期的脸不一致**，下个周期自动收敛 —— 而不是死锁。
+        # 为了把这个窗口压到最小，`_apply_persona()` 在会话开始时就写，
+        # 离重开边界尽可能远。
+        #
+        # 顺带：定期重开也治了另一个毛病 —— 长跑之后画面会漂（自回归状态
+        # 越滚越偏），重开等于periodically 把它拉回参考图。
         while not self.inbox.closed:
+            self._adopt_pending_face()
             try:
                 self._run_once(pipe)
             except Exception:
@@ -386,17 +337,20 @@ class LiveAvatarPipelineSource:
                 return
             if self.inbox.closed:
                 return
-            log.info("换脸重开生成循环：%s", self._cfg["ref_image_path"])
+            log.info("到重开边界（%d 块），重开生成循环：%s",
+                     self._restart_every, self._cfg["ref_image_path"])
 
     def _run_once(self, pipe) -> None:
-        """跑一轮生成循环。**正常返回 = 要换脸重开**，抛异常 = 真出事了。"""
+        """跑一轮生成循环。**正常返回 = 到重开边界**，抛异常 = 真出事了。"""
+        blocks = 0
         for item in self._generate(pipe):
             if self.inbox.closed:
                 break
-            # ⚠️ 放在这里而不是循环末尾：每个 rank 每个块都要走到一次，
-            #    `continue` 之前也不能跳过（DiT rank 走的正是 continue 那条）。
-            #    漏掉任何一个 rank 的任何一次，集合通信就错位、整组死等。
-            if self._should_reload():
+            # ⚠️ 计数放在**所有分支之前**，每个 rank 每块都要加到一次。
+            #    DiT rank 走的是下面那条 `continue`，漏掉它就会跟 VAE rank
+            #    在不同的块上跳出去 —— 那正是要避免的死锁。
+            blocks += 1
+            if blocks >= self._restart_every:
                 return
             if item is None:
                 continue                 # DiT rank 只 yield None，不出帧
