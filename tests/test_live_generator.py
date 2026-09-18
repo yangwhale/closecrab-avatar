@@ -394,3 +394,30 @@ async def test_drift_is_measured_not_assumed():
     #    这条用例会变成一句「它没报错」而不是「它真的在量」。
     await drain(gen, 2, timeout=0.3)
     assert gen._max_drift > 0, "跑偏了却没记下来"
+
+
+@pytest.mark.asyncio
+async def test_pairs_two_20ms_audio_with_one_40ms_video():
+    """⭐ Chris 2026-09-18 的原话：「音频一帧 20 毫秒，两帧 40 毫秒；视频一帧
+    40 毫秒。这两个算一对，两边都凑够 40 毫秒了才能发。」
+
+    这条就是把那个说法直接钉下来：喂 20 ms 的音频帧和 25 fps 的视频，
+    放出来的**比例必须是 2:1**。
+
+    ⚠️ 代码里不是数个数，是**按时长记账**（累计秒数之差不超过一帧）。
+    两者在这个场景下等价，而记账法多一层保险：TTS 哪天把帧长改成 10 ms
+    或者模型换成 30 fps，2:1 就错了，记账法自己跟着变。
+    """
+    src = FakeSource()
+    gen = LiveAvatarGenerator(src)
+    gen._preroll = 0
+    for _ in range(40):
+        await gen.push_audio(pcm_frame(0.02))      # 20 ms 一帧
+    for _ in range(20):
+        src.emit()                                 # 40 ms 一帧（25 fps）
+    got = await drain(gen, 60, timeout=2.0)
+    a = sum(1 for g in got if isinstance(g, rtc.AudioFrame))
+    v = sum(1 for g in got if isinstance(g, rtc.VideoFrame))
+    assert v > 5, f"视频没走起来：{v}"
+    # 允许 ±1 的收尾零头，但比例必须在 2:1 附近，不能是 1:1 或 4:1。
+    assert abs(a - 2 * v) <= 2, f"配对比例不对：音频 {a} 帧 / 视频 {v} 帧"
