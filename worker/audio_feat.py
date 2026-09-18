@@ -179,9 +179,16 @@ class StreamingAudioFeat:
 
     def __init__(self, audio_encoder, *, pull, block_samples: int, fps: int,
                  device=None, dtype=None, sample_rate: int = 16000,
-                 lookback_s: float | None = None):
+                 lookback_s: float | None = None, fallback=None):
         self._enc = audio_encoder
         self._pull = pull
+        self._fallback = fallback
+        """`fallback(chunk, block_frames)` —— 我们这条炸了的时候顶上。
+
+        ⚠️ **必须接收已经取出来的那一块**，不能是「再调一次上游那个方法」——
+        上游那个会自己再 `get_audio_callback()` 拉一块，于是每次回退都吃掉
+        两块音频。持续回退的话画面会跑成两倍速，比口型不准难查得多。
+        """
         self._block_samples = int(block_samples)
         self._fps = int(fps)
         self._sr = int(sample_rate)
@@ -220,9 +227,27 @@ class StreamingAudioFeat:
     # ── 上游调的就是这一个 ────────────────────────────────────────
 
     def next_block(self, block_frames: int):
+        """⚠️ **绝不能让异常跑出这个函数。**
+
+        它跑在 VAE rank 上，算完要 `dist.send` 给四个 DiT rank。抛出去的话
+        那四个永远堵在 `dist.recv`，**整组五张卡一起死** —— 比「这一块口型
+        不准」糟得多。所以裹一层，失败就用上游的老办法把这一块顶过去。
+        """
+        chunk = np.asarray(self._pull(), dtype=np.float32).reshape(-1)
+        try:
+            return self._encode_block(chunk, block_frames)
+        except Exception:                                # noqa: BLE001
+            # **每块都记**，不去重：走上这条路是持续的口型退化，
+            # 压成一条会让人以为是偶发。
+            log.warning("滑窗音频编码失败，这一块回退老实现（口型会差一截）",
+                        exc_info=True)
+            if self._fallback is None:
+                raise
+            return self._fallback(chunk, block_frames)
+
+    def _encode_block(self, chunk: np.ndarray, block_frames: int):
         import torch
 
-        chunk = np.asarray(self._pull(), dtype=np.float32).reshape(-1)
         if chunk.size != self._block_samples and not self._warned_clip:
             # 不致命（下面按实际长度对齐），但说明几何算错了，值得知道。
             log.warning("回调给了 %d 个采样，期望 %d —— 块几何可能不一致",

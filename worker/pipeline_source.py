@@ -288,10 +288,19 @@ class LiveAvatarPipelineSource:
         #    每 12 帧还有 1 帧被喂静音。量化证据和推导全在 `audio_feat.py`。
         #    这里换成滑动窗口版（只回看、不预看，不增加延迟）。
         #    实例属性遮住类方法，上游那句 `self._streaming_...()` 就走到这儿。
+        def _old_way(chunk, block_frames: int):
+            """回退：上游那条逐块编码。**拿已经取出来的那一块，不重新拉。**
+
+            直接调上游那个方法的话它会自己再 `get_audio_callback()` 拉一块，
+            每次回退吃掉两块音频 —— 持续回退时画面跑成两倍速。
+            """
+            emb, _ = pipe.encode_audio_from_array(chunk, infer_frames=block_frames)
+            return emb[..., :block_frames].contiguous()
+
         self._feat = StreamingAudioFeat(
             pipe.audio_encoder, pull=self.inbox.pull_block,
             block_samples=self.geometry.block_samples, fps=self.geometry.fps,
-            device=pipe.device, dtype=pipe.param_dtype)
+            device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
         pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
 
         try:
