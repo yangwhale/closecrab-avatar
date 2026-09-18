@@ -72,7 +72,47 @@ _DEGRADATION = {
 
 
 def _env(name: str, default: str) -> str:
+    ov = _overrides()
+    if name in ov:
+        return str(ov[name]).strip()
     return (os.environ.get(name) or default).strip()
+
+
+_OVERRIDE_FILE = os.environ.get("CCA_PUBLISH_FILE", "/tmp/cca-publish.json")
+
+
+def _overrides() -> dict:
+    """临时覆盖文件，**每场会话读一次**。找不到 / 读坏了就当没有。
+
+    ## 为什么要有它
+
+    这几个参数只在「真机上看着顺不顺」这个判据下才有意义，而那个判据在我这儿
+    量不出来 —— 只能换一组、让 Chris 看一眼、再换一组。
+
+    走环境变量的话每换一次都要重启 worker，而重启一次是**三到四分钟**
+    （47 GB 权重 + 合 LoRA + 转 FP8）。一轮 A/B 五种组合就是二十分钟，
+    全花在等模型上。
+
+    走文件就不用重启：`video_publish_options()` 是在 `_publish_track()` 里调的，
+    每建一场会话读一次。改完文件，下一次开关 Avatar 就生效。
+
+        echo '{"CCA_VIDEO_CODEC":"VP8","CCA_VIDEO_BITRATE":"3000000"}' \
+            > /tmp/cca-publish.json
+
+    ⚠️ **它盖过环境变量**，而且不会有人记得删。所以每次选定的值都会打进日志
+    （见 `video_publish_options` 的文档），排障时一眼能看出当时发的是什么 ——
+    「以为在用默认值，其实文件还在」是这类开关最容易出的事故。
+    """
+    try:
+        import json
+        with open(_OVERRIDE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:                                    # noqa: BLE001
+        log.warning("读 %s 失败，忽略覆盖", _OVERRIDE_FILE, exc_info=True)
+        return {}
 
 
 def video_publish_options(*, fps: int) -> rtc.TrackPublishOptions:
