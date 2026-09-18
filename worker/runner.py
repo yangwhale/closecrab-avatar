@@ -27,6 +27,8 @@ import os
 import socket
 import sys
 
+import pathlib
+
 import aiohttp
 import numpy as np
 from livekit import rtc
@@ -45,6 +47,17 @@ log = logging.getLogger("liveavatar.worker")
 
 HEARTBEAT_S = 10.0
 RECONNECT_BACKOFF_S = 3.0
+
+# 当前这张脸的图 —— **路径固定**，换脸就是覆盖它再重启。
+# 固定路径的好处：`--image` 永远是同一个值，启动命令不用改，
+# 也就不会出现「进程活着但命令行里写的是另一张图」这种对不上的状态。
+_FACE_PATH = os.environ.get("CCA_FACE_PATH", "/tmp/cca-current-face.png")
+_FACE_VERSION_PATH = _FACE_PATH + ".version"
+
+# 退出码：换脸。外层 wrapper 见到它就重新拉起（见 start-avatar-worker.sh）。
+# 单独一个码是为了让「主动换脸」和「崩了」在日志和监控里分得开 ——
+# 混在一起的话，一次正常换脸会看起来像一次崩溃。
+_EXIT_FACE_CHANGED = 42
 
 
 def _load_image(path: str | None, size: tuple[int, int]) -> np.ndarray:
@@ -74,8 +87,14 @@ class Worker:
         self._image_path = image_path
         self._source = source
         self._active: set[str] = set()
-        # 当前这张脸的版本。启动时是命令行那张，没有版本号。
-        self._face_version: str | None = None
+        # 当前这张脸的版本。**从盘上读回来** —— 不读的话重启后又会认为
+        # 「形象变了」，于是再退出一次，变成无限重启。这类自激循环最难发现：
+        # 每一轮单看都是「正确地检测到变化并重启」。
+        try:
+            self._face_version = pathlib.Path(_FACE_VERSION_PATH).read_text(
+                encoding="utf-8").strip() or None
+        except OSError:
+            self._face_version = None
 
     async def run(self) -> None:
         async with aiohttp.ClientSession() as http:
@@ -128,45 +147,61 @@ class Worker:
                 asyncio.create_task(self._run_session(http, job))
 
     async def _apply_persona(self, http: aiohttp.ClientSession, job: dict) -> None:
-        """这一场该用哪张脸 —— 跟上一场不一样就请求换。
+        """这一场该用哪张脸 —— 跟现在这张不一样就**整组重启**。
 
-        ⚠️ **只有 VAE rank 会走到这里**（DiT rank 在 `run_blocking()` 里没回来），
-        所以这就是那个「知道会话的 rank」。它只是记下意愿，真正的切换由
-        `_should_reload()` 广播给整组，在下一个块边界上一起做 ——
-        单方面重开循环会把另外四个 rank 永远堵在 `dist.recv` 上。
+        ## 为什么是重启，不是热切
 
-        没设过形象图（`persona_version` 为 None）是**正常状态不是故障**：
-        保持启动时那张，一声不吭地继续。
+        Chris 2026-09-18：「本着极简的原则，不应该传个图、服务器知道换图了、
+        然后重启一下这个视频流生成的进程就完了吗？」—— 对，就这么简单。
+
+        在此之前我试过三种「不重启就换脸」的办法，全部撞墙，而且撞的都是
+        五卡咬合这个根上的东西（默认组抢配对 / `new_group` 被 NCCL 拒绝 /
+        块计数要引入一致性取舍）。**它们复杂度全花在「避免重启」上，
+        而重启本身其实完全可以接受**：换形象不是对话中途的高频操作，
+        等三四分钟换一张脸，比一套随时可能死锁的热切机制划算得多。
+
+        > 教训：先问「这件事贵在哪、贵多少、能不能接受」，
+        > 再决定要不要为了绕开它付复杂度。我跳过了这一步，直接开始绕。
+
+        ## 怎么重启
+
+        参考图路径**固定**（`--image` 指向 `_FACE_PATH`），换脸就是把新图写到
+        那个路径，然后退出进程。torchrun 见一个 rank 退出会把整组收掉，
+        外层 `start-avatar-worker.sh` 的循环再拉起来 —— 五个 rank 自然一致，
+        **不需要任何跨 rank 协调**。
+
+        没设过形象图是正常状态：一声不吭地继续用当前那张。
         """
         ver, url = job.get("persona_version"), job.get("persona_url")
-        if not ver or not url:
+        if not ver or not url or ver == self._face_version:
             return
-        if ver == self._face_version:
-            return                        # 跟现在这张一样，不用折腾
         try:
             async with http.get(f"{self._gw}{url}",
                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status != 200:
-                    log.warning("取形象图失败 %s —— 这一场继续用旧的那张", r.status)
+                    log.warning("取形象图失败 %s —— 继续用当前这张", r.status)
                     return
                 data = await r.read()
-                ext = {"image/png": ".png", "image/webp": ".webp"}.get(
-                    r.headers.get("Content-Type", ""), ".jpg")
         except Exception as e:                        # noqa: BLE001
             # 取不到图**不能让会话起不来** —— 旧脸总比没脸好。
-            log.warning("取形象图出错（%s）—— 这一场继续用旧的那张", e)
+            log.warning("取形象图出错（%s）—— 继续用当前这张", e)
             return
-        path = f"/tmp/cca-face-{job.get('persona_role', 'principal')}-{ver}{ext}"
         try:
-            with open(path, "wb") as f:
+            tmp = _FACE_PATH + ".tmp"
+            with open(tmp, "wb") as f:
                 f.write(data)
+            os.replace(tmp, _FACE_PATH)               # 原子替换，别让下次启动读到半张
+            pathlib.Path(_FACE_VERSION_PATH).write_text(ver, encoding="utf-8")
         except OSError as e:
-            log.warning("形象图落盘失败（%s）—— 继续用旧的那张", e)
+            log.warning("形象图落盘失败（%s）—— 继续用当前这张", e)
             return
-        self._face_version = ver
-        log.info("这一场换脸：角色=%s 版本=%s → %s",
-                 job.get("persona_role"), ver, path)
-        self._source.request_face(path)
+
+        log.warning("形象换了（%s → %s），整组重启换脸", self._face_version, ver)
+        # ⚠️ 用 `os._exit` 不用 `sys.exit`：这里在 asyncio 任务里，
+        #    `SystemExit` 会被事件循环吞掉变成一条 "Task exception was never
+        #    retrieved"，进程照样活着 —— 那就变成「说要重启但没重启」，
+        #    正是今天反复吃亏的那种「回执不等于结果」。
+        os._exit(_EXIT_FACE_CHANGED)
 
     async def _run_session(self, http: aiohttp.ClientSession, job: dict) -> None:
         psid = job["provider_session_id"]
