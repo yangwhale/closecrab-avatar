@@ -179,3 +179,46 @@ def test_size_comes_from_the_model():
     """⭐ 尺寸取模型真实出帧尺寸，不取请求值 —— 模型按 64 的网格取整。"""
     src, gen = make()
     assert gen.size == src.size
+
+
+# ── ⭐ 音视频交错：把视频饿死的那个 bug ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_audio_and_video_interleave_one_by_one():
+    """⭐ 一轮最多各吐一帧。**不能把音频抽干再吐视频。**
+
+    下游 `_forward_video` 是单个任务，音频视频都从这一个生成器拿，拿到音频
+    就 `await audio_source.capture_frame()` —— 那个调用按实时阻塞。
+
+    「音频有多少吐多少」的写法遇上成段灌进来的 TTS：一句话瞬间在队列里堆几秒
+    音频，于是下游卡在音频里几秒钟一帧视频都收不到，而模型还在 25 fps 生产，
+    帧队列满了开始丢。实测模型产出 450 帧全好，线上只到 98 帧、5.3 fps、
+    44% 解不出画面 —— 表现成「一直黑屏，说完话几秒后蹦出一张脸」。
+
+    判据就是吐出来的顺序必须是 AVAVAV，不能是 AAAA…VVVV。
+    """
+    src, gen = make()
+    for _ in range(6):
+        await gen.push_audio(pcm_frame(0.1))     # 音频先堆满，模拟 TTS 成段灌
+        src.emit()
+    kinds = ["A" if isinstance(x, rtc.AudioFrame) else "V"
+             for x in await drain(gen, 8)]
+    assert "".join(kinds) == "AVAVAVAV", \
+        f"没有交错，视频会被饿死：{''.join(kinds)}"
+
+
+@pytest.mark.asyncio
+async def test_video_still_flows_while_audio_is_backlogged():
+    """音频积压时视频**不能停**。
+
+    上一条测顺序，这条测后果：音频堆了 20 帧，视频只有 3 帧 —— 这 3 帧必须
+    在前 6 次产出里就出来，而不是排在 20 帧音频后面。
+    """
+    src, gen = make()
+    for _ in range(20):
+        await gen.push_audio(pcm_frame(0.1))
+    for _ in range(3):
+        src.emit()
+    first6 = await drain(gen, 6)
+    videos = sum(1 for x in first6 if isinstance(x, rtc.VideoFrame))
+    assert videos == 3, f"前 6 帧里只有 {videos} 帧视频 —— 视频被音频挡住了"

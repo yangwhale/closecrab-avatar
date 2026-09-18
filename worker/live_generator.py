@@ -139,15 +139,39 @@ class LiveAvatarGenerator(VideoGenerator):
 
         没帧的时候短睡一下，别空转 —— 这是「让出 CPU」不是「排节奏」，
         所以取一个远小于帧间隔的值。
+
+        ⚠️⚠️ **一轮最多各吐一帧，绝不能「把音频抽干再吐视频」。**
+
+        这一条是 2026-09-18 实测出来的，代价很大，写清楚：
+
+        下游 `_forward_video` 是**单个任务**，音频和视频都从这一个生成器里拿，
+        拿到音频就 `await audio_source.capture_frame()` —— 而那个调用是**按实时
+        阻塞**的（音频源就是整条流水线的时钟，这是 AVSynchronizer 的设计）。
+
+        原来这里写的是「音频有多少吐多少，然后视频有多少吐多少」。TTS 是**成段
+        灌进来**的，一句话瞬间就在队列里堆了好几秒音频 —— 于是一进循环就吐出
+        几秒钟的音频帧，下游卡在音频 `capture_frame` 里**好几秒一帧视频都收不到**。
+        这几秒里模型还在以 25 fps 生产，我们自己的帧队列满了开始丢最旧的。
+
+        实测：模型侧产出 450 帧全部正常，线上只收到 98 帧、5.3 fps，
+        其中约 44% 因为丢了参考帧而解不出画面。**表现出来就是「一直黑屏，
+        说完话过几秒才蹦出一张脸」** —— 而每一层自己看都是正常的：
+        模型说我产出 25 fps，编码器说我在编，客户端说我收到了帧。
+
+        一轮各吐一帧就把这个解开了：音频帧是 10~100 ms、视频帧是 40 ms，
+        交替吐出去，下游那次实时阻塞天然变成视频的节拍器。
+
+        > 教训：**「优先级」不等于「先把它抽干」。** 下游是单消费者时，
+        > 抽干高优先级的那一路 ＝ 把另一路饿死整整一个批次的时长。
         """
         idle = 1.0 / (self._geom.fps * 4)
         while True:
-            # 音频优先、有多少发多少：它不能等视频。
             sent = False
-            while not self._audio_out.empty():
+            # 音频先于视频 —— 它不能等。但**只拿一帧**，理由见上面。
+            if not self._audio_out.empty():
                 yield self._audio_out.get_nowait()
                 sent = True
-            while (img := self._src.next_frame()) is not None:
+            if (img := self._src.next_frame()) is not None:
                 yield to_video_frame(img)
                 sent = True
             if not sent:
