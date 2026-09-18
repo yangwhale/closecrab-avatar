@@ -64,6 +64,7 @@ import threading
 
 import numpy as np
 
+from .audio_feat import StreamingAudioFeat
 from .audio_stream import BlockGeometry, PcmInbox
 
 log = logging.getLogger("closecrab.avatar.pipeline")
@@ -101,6 +102,7 @@ class LiveAvatarPipelineSource:
         self._thread: threading.Thread | None = None
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
+        self._feat: StreamingAudioFeat | None = None
         self._frame_seq = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
@@ -145,6 +147,10 @@ class LiveAvatarPipelineSource:
         而且五个 rank 得一起重启（见文件头）。丢在途的就够了。
         """
         self.inbox.clear()
+        if self._feat is not None:
+            # 回看窗口里那一两秒是上一句的 —— 留着会当成下一句的上下文，
+            # 而 wav2vec 带自注意力，上下文会实实在在改掉特征值。
+            self._feat.reset()
         while True:
             try:
                 self._frames.get_nowait()
@@ -275,6 +281,18 @@ class LiveAvatarPipelineSource:
         # ⭐ 上游缺的就是这一行。只有 VAE rank 会调它（见文件头）；
         #    DiT rank 装了也不会被调，装上无害、少一个分支。
         pipe.get_audio_callback = self.inbox.pull_block
+
+        # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。
+        #    上游 `_streaming_encode_next_audio_block_or_random` 把每一块
+        #    0.48 s 音频**单独**过一遍 wav2vec，于是时间轴被拉伸 10%、
+        #    每 12 帧还有 1 帧被喂静音。量化证据和推导全在 `audio_feat.py`。
+        #    这里换成滑动窗口版（只回看、不预看，不增加延迟）。
+        #    实例属性遮住类方法，上游那句 `self._streaming_...()` 就走到这儿。
+        self._feat = StreamingAudioFeat(
+            pipe.audio_encoder, pull=self.inbox.pull_block,
+            block_samples=self.geometry.block_samples, fps=self.geometry.fps,
+            device=pipe.device, dtype=pipe.param_dtype)
+        pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
 
         try:
             for item in self._generate(pipe):
