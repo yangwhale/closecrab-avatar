@@ -32,6 +32,7 @@ import numpy as np
 from livekit import rtc
 from livekit.agents.voice.avatar import AvatarOptions, AvatarRunner, DataStreamAudioReceiver
 
+from .imageutil import upright
 from .publish_opts import TunedAvatarRunner
 from .generators import StaticImageGenerator
 
@@ -62,7 +63,6 @@ def _load_image(path: str | None, size: tuple[int, int]) -> np.ndarray:
     a = np.zeros((h, w, 4), dtype=np.uint8)
     a[..., 0], a[..., 1], a[..., 2], a[..., 3] = 30, 40, 60, 255
     return a
-
 
 class Worker:
     """控制面那一侧。**对模型只知道一件事：有没有 `source`。**
@@ -157,6 +157,7 @@ class Worker:
             return
         img = f"/tmp/cca-face-{job.get('persona_role', 'principal')}-{ver}{ext}"
         try:
+            data = upright(data) or data
             with open(img, "wb") as f:
                 f.write(data)
             # 原子写：模型循环随时可能在读，写一半被读到会拿到半个路径。
