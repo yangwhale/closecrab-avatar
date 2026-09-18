@@ -82,6 +82,12 @@ class LiveAvatarGenerator(VideoGenerator):
         self._src = source
         self._geom = source.geometry
         self._audio_out: asyncio.Queue[rtc.AudioFrame | AudioSegmentEnd] = asyncio.Queue()
+        # ⭐ 「这一场到底有没有收到音频」必须能从日志一眼看出来。
+        #    没有这个计数器的时候，一场没出画面的会话有两种完全不同的解释 ——
+        #    音频没进来（上游的事）vs 进来了但没生成（模型的事）—— 而两边
+        #    的日志都是**一片空白**，长得一模一样。查这个花了一上午。
+        self._audio_frames = 0
+        self._audio_seconds = 0.0
 
     @property
     def size(self) -> tuple[int, int]:
@@ -99,7 +105,15 @@ class LiveAvatarGenerator(VideoGenerator):
             #    不放行的话最后不足一块的部分会一直卡在缓冲里等下一句。
             self._src.inbox.mark_segment_end()
             await self._audio_out.put(frame)
+            log.info("音频段结束：本场累计 %d 帧 / %.1f s",
+                     self._audio_frames, self._audio_seconds)
             return
+
+        self._audio_frames += 1
+        self._audio_seconds += frame.samples_per_channel / frame.sample_rate
+        if self._audio_frames == 1:
+            log.info("⭐ 本场第一帧音频到了：%d Hz，%d 声道 —— 音频这条路是通的",
+                     frame.sample_rate, frame.num_channels)
 
         # 两条路要的东西不一样，别合并：
         #   音轨这一份**原样转发** —— 听众听到的是发送方的原始采样率，
