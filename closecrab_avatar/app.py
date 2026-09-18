@@ -201,53 +201,88 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
     # ⚠️ 上传走**原始字节**不走 multipart：客户端（iOS / 我的脚本 / curl）
     #    都只是发一张图，multipart 只是多一层编解码和一个容易搞错的边界。
 
+    # 一个房间里**不止一张脸**。Chris 2026-09-18：语音助手和本人各挂各的形象，
+    # 将来两边可能同时说话，得分得开。
+    #
+    # 角色写进存储键（`<房间>--<角色>`）而不是新开一层目录：`PersonaStore` 那套
+    # 原子写、历史归档、扩展名清理全是按「一个键一张图」写的，换成两层要重写
+    # 一遍那些边界。`--` 做分隔符是因为它过得了 `_safe()` 的白名单，而房间名里
+    # 基本不会出现。
+    ROLES = {"principal", "assistant"}
+
+    def persona_key(room: str, role: str) -> str:
+        if role not in ROLES:
+            raise HTTPException(400, f"角色只能是 {sorted(ROLES)}，给的是 {role!r}")
+        return f"{room}--{role}"
+
+    def persona_keys_for_read(room: str, role: str) -> list[str]:
+        """读的时候按顺序试。
+
+        ⚠️ 第二个是**老键**（没有角色的那种）。加角色之前存的图都在那儿，
+        不兜住的话 Chris 之前传的形象会凭空消失一次 —— 而那种「东西没了」
+        比报错更难让人相信是升级导致的。只有 principal 兜，
+        因为老数据在语义上就是「本人」。
+        """
+        keys = [persona_key(room, role)]
+        if role == "principal":
+            keys.append(room)
+        return keys
+
     @app.put("/avatar/persona/{room}")
     async def put_persona(room: str, request: Request,
-                          note: str = "",
+                          note: str = "", role: str = "principal",
                           api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
         data = await request.body()
         if not data:
             raise HTTPException(400, "请求体是空的 —— 图片要放在 body 里发原始字节")
         try:
-            p = personas.put(room, data, note=note)
+            p = personas.put(persona_key(room, role), data, note=note)
         except PersonaError as e:
             # 400 不是 500：这是调用方给错了东西，不是我们坏了。
             raise HTTPException(400, str(e)) from e
-        return {"status": "ok", **p.to_json()}
+        return {"status": "ok", "role": role, **p.to_json()}
 
     @app.get("/avatar/persona/{room}")
-    async def get_persona(room: str, api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
-        try:
-            p = personas.get(room)
-        except PersonaError as e:
-            raise HTTPException(400, str(e)) from e
-        if p is None:
-            # **404 而不是空对象** —— 「没设置过」和「设置成空」是两件事，
-            # 客户端要据此决定显示默认脸还是显示上传过的那张。
-            raise HTTPException(404, f"房间 {room} 还没设过形象图")
-        return p.to_json()
+    async def get_persona(room: str, role: str = "principal",
+                          api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
+        for key in persona_keys_for_read(room, role):
+            try:
+                p = personas.get(key)
+            except PersonaError as e:
+                raise HTTPException(400, str(e)) from e
+            if p is not None:
+                return {"role": role, **p.to_json()}
+        # **404 而不是空对象** —— 「没设置过」和「设置成空」是两件事，
+        # 客户端要据此决定显示默认脸还是显示上传过的那张。
+        raise HTTPException(404, f"房间 {room} 的 {role} 还没设过形象图")
 
     @app.get("/avatar/persona/{room}/image")
-    async def get_persona_image(room: str, api_key: ApiKey = Depends(auth)) -> Response:
-        try:
-            got = personas.read_image(room)
-        except PersonaError as e:
-            raise HTTPException(400, str(e)) from e
-        if got is None:
-            raise HTTPException(404, f"房间 {room} 还没设过形象图")
-        data, ctype = got
-        meta = personas.get(room)
-        # 带上版本当 ETag：客户端和 worker 都靠它判断「要不要重新拉」。
-        headers = {"ETag": f'"{meta.version}"'} if meta else {}
-        return Response(content=data, media_type=ctype, headers=headers)
+    async def get_persona_image(room: str, role: str = "principal",
+                                api_key: ApiKey = Depends(auth)) -> Response:
+        for key in persona_keys_for_read(room, role):
+            try:
+                got = personas.read_image(key)
+            except PersonaError as e:
+                raise HTTPException(400, str(e)) from e
+            if got is None:
+                continue
+            data, ctype = got
+            meta = personas.get(key)
+            # 带上版本当 ETag：客户端和 worker 都靠它判断「要不要重新拉」。
+            # ⚠️ 角色要进 ETag —— 两个角色的版本号各算各的，会撞。撞了的后果是
+            #    换了头像客户端还显示旧的，而且**不报错**。
+            headers = {"ETag": f'"{role}-{meta.version}"'} if meta else {}
+            return Response(content=data, media_type=ctype, headers=headers)
+        raise HTTPException(404, f"房间 {room} 的 {role} 还没设过形象图")
 
     @app.delete("/avatar/persona/{room}")
-    async def del_persona(room: str, api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
+    async def del_persona(room: str, role: str = "principal",
+                          api_key: ApiKey = Depends(auth)) -> dict[str, Any]:
         try:
-            existed = personas.delete(room)
+            existed = personas.delete(persona_key(room, role))
         except PersonaError as e:
             raise HTTPException(400, str(e)) from e
-        return {"status": "deleted" if existed else "nothing-to-delete"}
+        return {"status": "deleted" if existed else "nothing-to-delete", "role": role}
 
     # ── 运维 ──────────────────────────────────────────────────
     @app.get("/healthz")

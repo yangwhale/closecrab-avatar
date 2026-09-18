@@ -280,3 +280,63 @@ def test_persona_needs_auth(tmp_path):
     c, _ = _client(tmp_path)
     assert c.put("/avatar/persona/bunny", content=JPEG_BYTES).status_code == 401
     assert c.get("/avatar/persona/bunny/image").status_code == 401
+
+
+# ── ⭐ 一个房间两张脸：语音助手 / 本人 ──────────────────────────────
+
+def test_two_roles_have_independent_images(tmp_path):
+    """⭐ 语音助手和本人各挂各的形象，**互不覆盖**。
+
+    Chris 2026-09-18：将来两边可能同时说话，得分得开（一个大兔子、一个小兔子）。
+    共用一个键的话后传的会把先传的顶掉，而且**不报错** —— 用户只会发现
+    「我给助手换了张图，兔子也跟着变了」。
+    """
+    c, auth = _client(tmp_path)
+    other = JPEG_BYTES + b"\x00" * 16          # 内容不同，才能验证没串
+
+    assert c.put("/avatar/persona/bunny?role=principal",
+                 content=JPEG_BYTES, headers=auth).status_code == 200
+    assert c.put("/avatar/persona/bunny?role=assistant",
+                 content=other, headers=auth).status_code == 200
+
+    a = c.get("/avatar/persona/bunny/image?role=principal", headers=auth)
+    b = c.get("/avatar/persona/bunny/image?role=assistant", headers=auth)
+    assert a.content == JPEG_BYTES, "本人那张被助手顶掉了"
+    assert b.content == other, "助手那张被本人顶掉了"
+    # ETag 必须带角色：两个角色的版本号各算各的，会撞 —— 撞了的后果是
+    # 换了头像客户端还显示旧的，而且不报错。
+    assert a.headers["etag"] != b.headers["etag"]
+
+
+def test_role_defaults_to_principal(tmp_path):
+    """不带 role 的老调用 = 本人。老客户端不受影响。"""
+    c, auth = _client(tmp_path)
+    c.put("/avatar/persona/bunny", content=JPEG_BYTES, headers=auth)
+    assert c.get("/avatar/persona/bunny/image?role=principal",
+                 headers=auth).content == JPEG_BYTES
+
+
+def test_legacy_key_is_still_readable(tmp_path):
+    """⭐ 加角色**之前**存的图不能凭空消失。
+
+    老键（没有角色那一层）在语义上就是「本人」，所以 principal 读不到时
+    要回落到它。不兜住的话 Chris 之前传的形象会在升级那一刻不见 ——
+    「东西没了」比报错更难让人相信是升级导致的。
+    """
+    c, auth = _client(tmp_path)
+    # 直接照老格式落盘，模拟升级前就存在的数据
+    from closecrab_avatar.persona import PersonaStore
+    PersonaStore(str(tmp_path / "personas")).put("bunny", JPEG_BYTES)
+
+    r = c.get("/avatar/persona/bunny/image", headers=auth)
+    assert r.status_code == 200 and r.content == JPEG_BYTES, "老数据读不到了"
+    # 但助手那一路不该借到它 —— 老数据只代表本人。
+    assert c.get("/avatar/persona/bunny/image?role=assistant",
+                 headers=auth).status_code == 404
+
+
+def test_unknown_role_is_rejected(tmp_path):
+    """乱填角色要报 400，不能静默当成默认值 —— 那样上传会悄悄写错地方。"""
+    c, auth = _client(tmp_path)
+    r = c.put("/avatar/persona/bunny?role=乱写", content=JPEG_BYTES, headers=auth)
+    assert r.status_code == 400, r.text
