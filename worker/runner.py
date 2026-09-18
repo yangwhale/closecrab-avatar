@@ -30,7 +30,7 @@ import sys
 import aiohttp
 import numpy as np
 from livekit import rtc
-from livekit.agents.voice.avatar import AvatarOptions, AvatarRunner, DataStreamAudioReceiver
+from livekit.agents.voice.avatar import AvatarOptions, DataStreamAudioReceiver
 
 from .publish_opts import TunedAvatarRunner
 from .generators import StaticImageGenerator

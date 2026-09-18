@@ -102,7 +102,6 @@ class LiveAvatarPipelineSource:
         self._thread: threading.Thread | None = None
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
-        self._vae_rank = 0
         self._restart_every = _RESTART_EVERY_BLOCKS
         self._frame_seq = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
@@ -171,8 +170,6 @@ class LiveAvatarPipelineSource:
         rank, world = dist.get_rank(), dist.get_world_size()
         n_dit = self._cfg["num_gpus_dit"]
         self._is_vae_rank = rank >= n_dit
-        # 广播 src 用它。**不能写死 0**：0 是 DiT rank，它不知道会话的事。
-        self._vae_rank = n_dit
 
         cfg = WAN_CONFIGS[self._cfg["task"]]
         self._geom = BlockGeometry.from_model_config(cfg)
