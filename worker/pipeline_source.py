@@ -86,6 +86,11 @@ class LiveAvatarPipelineSource:
         self._thread: threading.Thread | None = None
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
+        # 换脸：VAE rank 记意愿，`_should_reload()` 广播给其余四个。
+        # 加锁是因为 `request_face()` 在**事件循环线程**上调，而读它的是模型线程。
+        self._face_lock = threading.Lock()
+        self._pending_face: str | None = None
+        self._vae_rank = 0
         self._frame_seq = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
@@ -153,6 +158,8 @@ class LiveAvatarPipelineSource:
         rank, world = dist.get_rank(), dist.get_world_size()
         n_dit = self._cfg["num_gpus_dit"]
         self._is_vae_rank = rank >= n_dit
+        # 广播 src 用它。**不能写死 0**：0 是 DiT rank，它不知道会话的事。
+        self._vae_rank = n_dit
 
         cfg = WAN_CONFIGS[self._cfg["task"]]
         self._geom = BlockGeometry.from_model_config(cfg)
@@ -245,24 +252,104 @@ class LiveAvatarPipelineSource:
 
     # ── 模型线程 ──────────────────────────────────────────────────
 
+    def request_face(self, path: str) -> None:
+        """换一张参考图。**不立刻生效** —— 下一个块边界上整组一起换。
+
+        只有拿到会话的那个 rank（VAE rank）会调这个方法；它把意愿记下来，
+        由 `_should_reload()` 广播给其余四个 rank。理由见那个方法。
+        """
+        with self._face_lock:
+            if path and path != self._cfg["ref_image_path"]:
+                self._pending_face = path
+                log.info("收到换脸请求：%s（下一个块边界生效）", path)
+
+    def _should_reload(self) -> bool:
+        """整组要不要在这里一起重开生成循环。**这是一次集合通信。**
+
+        ## 为什么必须广播，不能各自判断
+
+        参考图是在 `generate()` 开始那一刻传进去的，换脸 ＝ 重开那个循环。
+        而这个循环是五个 rank 一起跑的：DiT rank 在里面 `dist.send`，
+        VAE rank 在里面 `dist.recv`。**只要有一个 rank 提前跳出去，
+        剩下的就会永远堵在通信上** —— 不报错，整条流水线静默死掉。
+
+        「谁想换脸」这件事只有 VAE rank 知道（会话在它手上），所以由它
+        广播一个标志位。这里的关键是**每个 rank 每个块都调一次**，
+        调用点和次数完全一致，集合通信才不会错位。
+
+        ⚠️ 上游那个生成器在每个 rank 上都是**一个块 yield 一次**
+        （DiT rank `yield None`，VAE rank `yield image`），所以「每 yield 一次
+        调一次」在五个 rank 上是对齐的。这条是这套协调能成立的前提，
+        改上游版本时要重新确认。
+        """
+        import torch
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            # 单卡跑（测试 / 退化模式）：没有别人要等，自己说了算。
+            with self._face_lock:
+                return self._pending_face is not None
+
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        if self._is_vae_rank:
+            with self._face_lock:
+                flag[0] = 1 if self._pending_face is not None else 0
+        # src 必须是 VAE rank 的全局 rank —— 它是唯一知道会话的那个。
+        dist.broadcast(flag, src=self._vae_rank)
+        if int(flag[0]) == 0:
+            return False
+
+        # 换脸的路径本身也要广播：DiT rank 不知道图在哪，而 `generate()`
+        # 在每个 rank 上都要用到它（各自都会去读那张图）。
+        buf = torch.zeros(512, dtype=torch.uint8, device="cuda")
+        if self._is_vae_rank:
+            with self._face_lock:
+                raw = (self._pending_face or "").encode()[:512]
+            buf[:len(raw)] = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
+        dist.broadcast(buf, src=self._vae_rank)
+        path = bytes(buf.cpu().numpy()).rstrip(b"\x00").decode(errors="replace")
+        if path:
+            self._cfg["ref_image_path"] = path
+        with self._face_lock:
+            self._pending_face = None
+        return True
+
     def _run(self) -> None:
         pipe = self._pipe
         # ⭐ 上游缺的就是这一行。只有 VAE rank 会调它（见文件头）；
         #    DiT rank 装了也不会被调，装上无害、少一个分支。
         pipe.get_audio_callback = self.inbox.pull_block
 
-        try:
-            for item in self._generate(pipe):
-                if self.inbox.closed:
-                    break
-                if item is None:
-                    continue             # DiT rank 只 yield None，不出帧
-                for img in self._to_rgba(item):
-                    self._probe(img)
-                    self._offer(img)
-        except Exception:
-            # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
-            log.exception("生成中断，这一路退化成只出声")
+        # 外层这个 while 就是「换脸」：内层的 generate() 一旦跳出来，
+        # 就带着新的 ref_image_path 重开一轮。重开只重跑 Step 1（编码参考图 +
+        # VAE encode motion + 一次 barrier），**不重新加载模型权重** ——
+        # 所以是秒级，不是启动时那四分钟。
+        while not self.inbox.closed:
+            try:
+                self._run_once(pipe)
+            except Exception:
+                # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
+                log.exception("生成中断，这一路退化成只出声")
+                return
+            if self.inbox.closed:
+                return
+            log.info("换脸重开生成循环：%s", self._cfg["ref_image_path"])
+
+    def _run_once(self, pipe) -> None:
+        """跑一轮生成循环。**正常返回 = 要换脸重开**，抛异常 = 真出事了。"""
+        for item in self._generate(pipe):
+            if self.inbox.closed:
+                break
+            # ⚠️ 放在这里而不是循环末尾：每个 rank 每个块都要走到一次，
+            #    `continue` 之前也不能跳过（DiT rank 走的正是 continue 那条）。
+            #    漏掉任何一个 rank 的任何一次，集合通信就错位、整组死等。
+            if self._should_reload():
+                return
+            if item is None:
+                continue                 # DiT rank 只 yield None，不出帧
+            for img in self._to_rgba(item):
+                self._probe(img)
+                self._offer(img)
 
     def _probe(self, img: np.ndarray) -> None:
         """量一下**发出去的像素本身**，别只量「有没有帧」。

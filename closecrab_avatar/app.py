@@ -148,6 +148,24 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
             ttl_s=settings.max_session_s + 300,
         )
 
+        # ⭐ 这一场用哪张脸。**在建会话时就定下来**，别让 worker 自己去猜 ——
+        #    「哪个角色」这件事只有控制面同时看得见 room 和 agent_identity。
+        #
+        #    判据：数字人挂在谁名下就用谁的脸。`<bot>-speaker` 是本体播报那一路
+        #    （本人），其余按语音助手算。这条跟 iOS 那边 roster 的角色判定
+        #    是同一套语义，改一处要两处一起改。
+        persona_role = ("principal" if body.agent_identity.endswith("-speaker")
+                        else "assistant")
+        persona_version = None
+        for key in persona_keys_for_read(body.room_name, persona_role):
+            try:
+                got = personas.get(key)
+            except PersonaError:
+                got = None
+            if got is not None:
+                persona_version = got.version
+                break
+
         job = {
             "provider_session_id": provider_session_id,
             "livekit_url": body.livekit_url,
@@ -157,6 +175,13 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
             "agent_identity": body.agent_identity,
             "avatar_id": body.avatar_id,
             "image_url": body.image_url,
+            # worker 拿这三个决定要不要换脸。version 是 None 就是「这个角色
+            # 还没设过图」—— worker 保持启动时那张，**不要报错**：
+            # 没设过是正常状态，不是故障。
+            "persona_role": persona_role,
+            "persona_version": persona_version,
+            "persona_url": (f"/internal/persona/{body.room_name}/image"
+                            f"?role={persona_role}") if persona_version else None,
             "size": body.size or settings.size,
             "trim_k": settings.trim_k,
             "sample_rate": body.sample_rate or settings.sample_rate,
@@ -293,6 +318,27 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
                 "personas": personas.rooms()}
 
     # ── 内部：worker 注册与长轮询（不对外暴露）──────────────────
+    @app.get("/internal/persona/{room}/image")
+    async def internal_persona_image(room: str, role: str = "principal") -> Response:
+        """给 worker 取参考图。**不鉴权**，跟其余 `/internal/*` 一致。
+
+        为什么不让 worker 走对外那个端点：worker 手上没有客户端密钥，
+        给它一份意味着多一个要轮换、要分发的副本 —— 而它本来就在 VPC 内网，
+        跟控制面同一层信任域。（今天刚因为「一个密钥三处副本」漏掉一处栽过。）
+        """
+        for key in persona_keys_for_read(room, role):
+            try:
+                got = personas.read_image(key)
+            except PersonaError:
+                got = None
+            if got is None:
+                continue
+            data, ctype = got
+            meta = personas.get(key)
+            headers = {"ETag": f'"{role}-{meta.version}"'} if meta else {}
+            return Response(content=data, media_type=ctype, headers=headers)
+        raise HTTPException(404, f"房间 {room} 的 {role} 还没设过形象图")
+
     @app.post("/internal/workers/register")
     async def register(body: WorkerRegister) -> dict[str, Any]:
         store.upsert_worker(body.worker_id, body.capacity, body.meta)

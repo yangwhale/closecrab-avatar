@@ -74,6 +74,8 @@ class Worker:
         self._image_path = image_path
         self._source = source
         self._active: set[str] = set()
+        # 当前这张脸的版本。启动时是命令行那张，没有版本号。
+        self._face_version: str | None = None
 
     async def run(self) -> None:
         async with aiohttp.ClientSession() as http:
@@ -125,6 +127,47 @@ class Worker:
             if job:
                 asyncio.create_task(self._run_session(http, job))
 
+    async def _apply_persona(self, http: aiohttp.ClientSession, job: dict) -> None:
+        """这一场该用哪张脸 —— 跟上一场不一样就请求换。
+
+        ⚠️ **只有 VAE rank 会走到这里**（DiT rank 在 `run_blocking()` 里没回来），
+        所以这就是那个「知道会话的 rank」。它只是记下意愿，真正的切换由
+        `_should_reload()` 广播给整组，在下一个块边界上一起做 ——
+        单方面重开循环会把另外四个 rank 永远堵在 `dist.recv` 上。
+
+        没设过形象图（`persona_version` 为 None）是**正常状态不是故障**：
+        保持启动时那张，一声不吭地继续。
+        """
+        ver, url = job.get("persona_version"), job.get("persona_url")
+        if not ver or not url:
+            return
+        if ver == self._face_version:
+            return                        # 跟现在这张一样，不用折腾
+        try:
+            async with http.get(f"{self._gw}{url}",
+                                timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    log.warning("取形象图失败 %s —— 这一场继续用旧的那张", r.status)
+                    return
+                data = await r.read()
+                ext = {"image/png": ".png", "image/webp": ".webp"}.get(
+                    r.headers.get("Content-Type", ""), ".jpg")
+        except Exception as e:                        # noqa: BLE001
+            # 取不到图**不能让会话起不来** —— 旧脸总比没脸好。
+            log.warning("取形象图出错（%s）—— 这一场继续用旧的那张", e)
+            return
+        path = f"/tmp/cca-face-{job.get('persona_role', 'principal')}-{ver}{ext}"
+        try:
+            with open(path, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            log.warning("形象图落盘失败（%s）—— 继续用旧的那张", e)
+            return
+        self._face_version = ver
+        log.info("这一场换脸：角色=%s 版本=%s → %s",
+                 job.get("persona_role"), ver, path)
+        self._source.request_face(path)
+
     async def _run_session(self, http: aiohttp.ClientSession, job: dict) -> None:
         psid = job["provider_session_id"]
         self._active.add(psid)
@@ -140,6 +183,7 @@ class Worker:
                 w, h = self._source.size
                 gen = LiveAvatarGenerator(self._source)
                 fps = self._source.geometry.fps
+                await self._apply_persona(http, job)
                 # 上一场可能留下半句话没念完的 PCM —— 新会话从干净状态开始。
                 self._source.reset()
                 log.info("会话 %s 用真模型（%d×%d @ %d fps）", psid, w, h, fps)
