@@ -165,10 +165,21 @@ class LiveAvatarGenerator(VideoGenerator):
         ⚠️ 它**不是给生成延迟留的余量**。延迟由预缓冲吸收，跟这个数无关。
         """
 
-        self._max_drift = 0.0
-        """本段实测的最大对齐误差。**要量，不要猜。**
+        self._max_lead = 0.0
+        self._max_lag = 0.0
+        self._audio_live = False
+        """实测的对齐误差，**分正负两个方向记**。
 
-        这个数会在段落结束时打进日志。没有它的话，「对齐做对了没有」这件事
+        ⚠️ 只记一个绝对值是**错的**，2026-09-18 第一版就这么写，量出来
+        660~740 ms，看着像对齐彻底失效 —— 其实绝大部分是**句尾那截**：
+        音频说完了，缓冲里剩下的视频还在往外放，视频时间轴自然超过音频。
+        那是正常的收尾，不是失步。
+
+        所以分开记：`_max_lead` 是音频跑在前面（这个才该被额度管住），
+        `_max_lag` 是视频跑在前面（句尾必然出现，参考意义小）。
+        而且只在**音频还在流**的时候记 —— 段落一结束就停止统计。
+
+        两个数都会在段落结束时打进日志。没有它们的话，「对齐做对了没有」
         只能靠眼睛看嘴型 —— 而那正是我之前拍一个 120 毫秒出来的原因。
         """
 
@@ -193,15 +204,17 @@ class LiveAvatarGenerator(VideoGenerator):
             #
             # ⭐ 但要**明确放行**那截尾巴：inbox 平时攒够一整块才给模型，
             #    不放行的话最后不足一块的部分会一直卡在缓冲里等下一句。
+            self._audio_live = False       # 句尾那截视频不计入统计
             self._src.inbox.mark_segment_end()
             self._audio_out.append(frame)
-            self._dump.close()
             log.info("音频段结束：本场累计 %d 帧 / %.1f s；"
-                     "音画对齐实测最大偏差 %.0f ms（额度 %.0f ms）",
+                     "音频最多领先 %.0f ms（额度 %.0f ms）、最多落后 %.0f ms",
                      self._audio_frames, self._audio_seconds,
-                     self._max_drift * 1000, self._max_lead_s * 1000)
+                     self._max_lead * 1000, self._max_lead_s * 1000,
+                     self._max_lag * 1000)
             return
 
+        self._audio_live = True
         self._audio_frames += 1
         self._audio_seconds += frame.samples_per_channel / frame.sample_rate
         if self._audio_frames == 1:
@@ -226,6 +239,10 @@ class LiveAvatarGenerator(VideoGenerator):
         """
         self._audio_out.clear()
         self._src.reset()
+        # ⚠️ 录制**不在这里关** —— 打断之后还会接着说，整场只录一份。
+        #    2026-09-18 踩过：原来挂在「段落结束」上，结果一场会话录了 0.5 秒
+        #    就自己停了，拿到的文件里视频 93 帧、音频 0 字节。
+        #    「段落」和「会话」是两个粒度，这个工具要的是后者。
         # ⚠️ 抖动缓冲的状态也要清。不清的话打断之后 `_rolling` 还是 True，
         #    下一句**不重新攒**就直接开播 —— 那正好退回打断前的毛病，
         #    而且只在「被打断过」的那几句上出现，最难复现。
@@ -281,9 +298,12 @@ class LiveAvatarGenerator(VideoGenerator):
             # ⚠️ 在**循环开头**量，不是末尾。末尾量的话每次 `yield` 之后
             #    生成器就挂起了，那一行常常根本跑不到 —— 于是偏差永远是 0，
             #    一个「测量」变成了一句安慰。
-            drift = abs(self._audio_out_s - self._video_out_s)
-            if drift > self._max_drift:
-                self._max_drift = drift
+            if self._audio_live:
+                d = self._audio_out_s - self._video_out_s
+                if d > self._max_lead:
+                    self._max_lead = d
+                elif -d > self._max_lag:
+                    self._max_lag = -d
 
             # ── 攒够了才开播 ──
             # 攒的时候两路都不吐：只拦视频的话音频会先跑掉半秒，

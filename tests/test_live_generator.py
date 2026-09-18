@@ -378,8 +378,8 @@ async def test_alignment_does_not_drift_over_many_blocks():
     for _ in range(5):
         src.emit()
     await drain(gen, 60, timeout=2.0)
-    assert gen._max_drift <= 2 / G.fps, \
-        f"跑了 50 帧偏差涨到 {gen._max_drift*1000:.0f} ms —— 在漂"
+    assert gen._max_lead <= 2 / G.fps, \
+        f"跑了 50 帧偏差涨到 {gen._max_lead*1000:.0f} ms —— 在漂"
 
 
 @pytest.mark.asyncio
@@ -393,7 +393,7 @@ async def test_drift_is_measured_not_assumed():
     #    音频是在那一圈里才吐出去的。只转一圈的话量到的永远是 0，
     #    这条用例会变成一句「它没报错」而不是「它真的在量」。
     await drain(gen, 2, timeout=0.3)
-    assert gen._max_drift > 0, "跑偏了却没记下来"
+    assert gen._max_lead > 0, "跑偏了却没记下来"
 
 
 @pytest.mark.asyncio
@@ -425,3 +425,36 @@ async def test_emission_ratio_tracks_frame_durations():
     # 时长必须配得上：音频 a×100ms ≈ 视频 v×40ms，误差不超过两帧视频。
     assert abs(a * 0.1 - v * 0.04) <= 0.08, \
         f"配比不对：音频 {a} 帧（{a*0.1:.2f}s）/ 视频 {v} 帧（{v*0.04:.2f}s）"
+
+
+@pytest.mark.asyncio
+async def test_dump_survives_a_segment_end():
+    """⭐ 录制的粒度是**会话**不是**段落**。
+
+    2026-09-18 踩过：原来把 `close()` 挂在 `AudioSegmentEnd` 上，结果一场
+    会话录了 0.5 秒就自己停了 —— 拿到的文件里视频 93 帧、音频 0 字节，
+    而日志里「开始录制」「录制结束」都打得好好的。**每一行都正常，东西是空的。**
+    """
+    src, gen = make(preroll=0)
+    gen._dump.on = True                        # 假装在录
+    await gen.push_audio(AudioSegmentEnd())
+    await drain(gen, 1, timeout=0.3)
+    assert gen._dump.on is True, "段落结束把整场录制关掉了"
+
+
+@pytest.mark.asyncio
+async def test_tail_after_segment_end_is_not_counted_as_desync():
+    """⭐ 句尾那截不算失步。
+
+    音频说完了，缓冲里剩的视频还在往外放 —— 视频时间轴自然超过音频。
+    把它算进偏差的话会量出 600~700 ms，看着像对齐彻底失效，
+    而实际上那是正常收尾。第一版指标就是这么把自己吓着的。
+    """
+    src, gen = make(preroll=0)
+    await gen.push_audio(pcm_frame(0.1))
+    await gen.push_audio(AudioSegmentEnd())
+    for _ in range(30):                        # 句尾还有 1.2 秒视频要放
+        src.emit()
+    await drain(gen, 30, timeout=1.5)
+    assert gen._max_lag < 0.2, \
+        f"句尾那截被算成失步了：{gen._max_lag*1000:.0f} ms"
