@@ -251,6 +251,29 @@ ATTR_WANT_BY_ROLE = {
 }
 """客户端写：这个角色要不要数字人。**一个角色一个键。**"""
 
+# ── ⭐ 一个角色一个数字人，不是「换主人」──────────────────────────
+#
+# Chris 2026-09-18：「Bunny 用 Bunny 的，语音助手用语音助手的。切换的时候是
+# 其中一个关了、另外一个加进来，而不是把房间里那个 Avatar 换主人。因为将来
+# 资源多的时候，两个 Avatar 都进来。」
+#
+# 所以每个被分配到的角色**各起一路会话、各进一个 participant**：
+#
+#     cc-avatar-principal   publish_on_behalf = <bot>-speaker
+#     cc-avatar-assistant   publish_on_behalf = <助手的 identity>
+#
+# 切换 = 关掉一路会话 + 开另一路，**不是改现有那一路的归属**。
+#
+# ⚠️ 为什么这个区别要紧：如果做成「换主人」，那么「两个都在」这件事在
+#    数据模型里根本表达不出来 —— 等资源变多时要重写一遍，而且客户端认
+#    参与者的那套逻辑（按 `lk.publish_on_behalf` 关联）也要跟着改。
+#    各带各的，从一路到两路只是**多建一个会话**，别的地方一个字不用动。
+#
+# ⚠️ 现在的 `cc-avatar` 这个固定 identity 要改成带角色后缀 —— 否则两路同时
+#    在房间里会撞名字。改的时候 iOS 那边按 `lk.avatar_provider` 全房扫的
+#    写法**不用动**（它本来就不依赖具体名字），只有「哪条轨对应哪个角色」
+#    需要按 `publish_on_behalf` 去认。
+
 # 只有一路 Live Avatar 时先给谁。**本体优先** —— Chris 定的。
 ALLOC_PRIORITY = (AvatarRole.PRINCIPAL, AvatarRole.ASSISTANT)
 
