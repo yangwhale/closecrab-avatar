@@ -211,81 +211,76 @@ def is_user_visible_problem(state: AvatarState) -> bool:
     return state is AvatarState.UNAVAILABLE
 
 
-# ── 数字人归谁：从「开/关」升级成「选一个角色」──────────────────────
+# ── 每个角色各有一个开关，分配归服务端 ──────────────────────────────
 #
-# Chris 2026-09-18 定的新形态：
+# Chris 2026-09-18：「每一个角色应该有自己的 property。Bunny 有一个开和关，
+# 语音助手有一个开和关。后台到时候可以按照资源来决定把 Live Avatar 给谁。」
 #
-#   · 系统设置里那个全局开关**拿掉** —— 它不该是全局的
-#   · 房间里固定两个角色：语音助手、本体（bot 自己）
-#   · 在角色牌子上双击 = 把数字人给它；双击当前拿着的那个 = 关掉
-#   · **同一时刻只有一个角色能拿到数字人**（一条视频轨，全房共享）
-#   · 小屏幕标记画在当前拿着的那个牌子上，双击另一个就挪过去
+# ## 为什么不是一个「归谁」的单选
 #
-# 开关只表达「想要」。真加不加得看服务端在不在（`service_ok`），
-# 这一点跟旧的 `decide()` 一致。
+# 我第一版写成了单选（`cc.avatar.target` = assistant / principal / off），
+# **那是把两件事揉在一起了**：
 #
-# ⚠️ **这一段是新契约，旧的 `ATTR_WANT` 暂时保留** —— 三层（iOS / bot /
-#    网关）不可能同一秒切换，中间必然有一段新旧并存。等三层都上了新的
-#    再删旧的，别现在就拆，那会造出一个「谁先部署谁就坏」的窗口。
+#     客户端表达的是**意图** —— 这个角色我想让它有脸
+#     服务端做的是**分配** —— 现在有几路 GPU，该给谁
+#
+# 揉在一起的后果：客户端被迫替服务端做资源决策，而它根本不知道有几路空闲。
+# 而且以后多一路 Live Avatar，协议就得跟着改 —— 分开的话协议一个字不用动，
+# 只是 `allocate()` 的 capacity 变大。
+#
+# 现在 iOS 上是「切换」形态（同时只开一个），但**那是客户端的产品选择，
+# 不是协议的限制**。协议允许两个都开。
+#
+# ⚠️ 旧的 `ATTR_WANT` 暂时保留：三层（iOS / bot / 网关）不可能同一秒切换，
+#    中间必然有新旧并存的窗口。三层都上了新的再删。
 
 
-class AvatarTarget(str, Enum):
-    """数字人现在归谁。"""
-
-    OFF = "off"
-    """没人要。"""
-
-    ASSISTANT = "assistant"
-    """语音助手 —— 改道它的音频。"""
+class AvatarRole(str, Enum):
+    """谁要这张脸。**名字跟形象库的 `persona_role` 共用一套。**"""
 
     PRINCIPAL = "principal"
-    """本体（bot 自己的播报那一路）—— 改道它的音频。"""
+    """本体（bot 自己的播报那一路）。"""
+
+    ASSISTANT = "assistant"
+    """语音助手。"""
 
 
-ATTR_TARGET = "cc.avatar.target"
-"""客户端写：数字人归谁（`off` / `assistant` / `principal`）。
+ATTR_WANT_BY_ROLE = {
+    AvatarRole.PRINCIPAL: "cc.avatar.principal",
+    AvatarRole.ASSISTANT: "cc.avatar.assistant",
+}
+"""客户端写：这个角色要不要数字人。**一个角色一个键。**"""
 
-取代旧的布尔 `cc.avatar.want`。**角色名跟形象库那边是同一套**
-（`persona_role`），不要两处各起一套名字 —— 那样迟早对不上，
-而对不上的表现是「换了助手的图，兔子的脸变了」。
-"""
+# 只有一路 Live Avatar 时先给谁。**本体优先** —— Chris 定的。
+ALLOC_PRIORITY = (AvatarRole.PRINCIPAL, AvatarRole.ASSISTANT)
 
 
-def parse_target(raw: str | None) -> AvatarTarget:
-    """把属性解成目标。**认不出来一律当 OFF，不抛异常。**
+def wanted_roles(per_participant: dict[str, dict[str, str]]) -> set[AvatarRole]:
+    """一屋子客户端合出「哪些角色被要了」。
 
-    不抛是因为这条路径在房间事件回调里：抛出去会让一次属性变更整个丢掉，
-    而客户端不会重发 —— 状态就永久卡住了。
+    **任何一个人要，就算要** —— 跟 `decide_for_room()` 同一条聚合规则：
+    屋里另一个人把开关关了，不该把正在看的人的画面也掐掉。
+    一条轨的成本是固定的，多一个人看不多花钱。
 
-    认不出来当 OFF 而不是当「上一次那个」：陌生值多半来自版本不匹配的
-    客户端，让它**不占 GPU** 比让它继续占着安全。
+    缺省 False：老客户端根本不发这些键，默认开的话每个连进来的旧客户端
+    都会去抢一路 GPU，而它连显示的界面都没有。
     """
-    try:
-        return AvatarTarget(str(raw or "").strip().lower())
-    except ValueError:
-        return AvatarTarget.OFF
+    out: set[AvatarRole] = set()
+    for attrs in per_participant.values():
+        for role, key in ATTR_WANT_BY_ROLE.items():
+            if parse_flag(attrs.get(key), default=False):
+                out.add(role)
+    return out
 
 
-def target_for_room(per_participant: dict[str, dict[str, str]]) -> AvatarTarget:
-    """一屋子客户端合成**一个**目标。
+def allocate(wanted: set[AvatarRole], *, capacity: int = 1) -> list[AvatarRole]:
+    """按现有资源决定实际给谁。**这是服务端的决定，不是客户端的。**
 
-    数字人是一条视频轨、全房共享，所以只能有一个答案 —— 跟
-    `decide_for_room()` 同一个道理。
+    容量不够时按 `ALLOC_PRIORITY` 取前 N 个 —— 现在只有一路，
+    两个都开就给本体。
 
-    ## 冲突怎么办：谁都行，但**必须稳定**
-
-    两个人分别选了不同的角色时，结果不能取决于字典遍历顺序 ——
-    那会让画面在两个角色之间来回跳，而且复现不了。按参与者 identity
-    排序取第一个明确表态的：**任意但确定**。
-
-    > 这里刻意不做「后点的赢」：那需要时间戳，而属性变更没有可靠的顺序。
-    > 与其编一个假的优先级，不如给一个稳定的、能解释的结果。
+    ⚠️ 返回**列表不是单个** —— 以后多一路的时候这里一个字不用改，
+    协议也不用动。把「现在只有一路」写死进返回类型，等于把一个临时的
+    资源现状焊进契约。
     """
-    picks = [
-        (ident, parse_target(attrs.get(ATTR_TARGET)))
-        for ident, attrs in sorted(per_participant.items())
-    ]
-    for _, t in picks:
-        if t is not AvatarTarget.OFF:
-            return t
-    return AvatarTarget.OFF
+    return [r for r in ALLOC_PRIORITY if r in wanted][:max(0, capacity)]

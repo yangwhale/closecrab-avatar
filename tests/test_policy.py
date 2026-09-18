@@ -17,50 +17,47 @@ def test_policy_contract_holds():
     assert r.returncode == 0, f"契约检查没过：\n{r.stdout[-2000:]}\n{r.stderr[-500:]}"
 
 
-# ── ⭐ 新契约：数字人归谁 ──────────────────────────────────────────
+# ── ⭐ 新契约：每角色一个开关，服务端分配 ──────────────────────────
 
-def test_target_parses_three_values():
-    from closecrab_avatar.policy import AvatarTarget as T, parse_target
-    assert parse_target("assistant") is T.ASSISTANT
-    assert parse_target("principal") is T.PRINCIPAL
-    assert parse_target("off") is T.OFF
-
-
-def test_unknown_target_falls_back_to_off_not_previous():
-    """⭐ 认不出来当 OFF。
-
-    陌生值多半来自版本不匹配的客户端 —— 让它**不占 GPU** 比让它继续占着安全。
-    而且绝不能抛：这条路径在房间事件回调里，抛出去那次属性变更整个丢掉，
-    客户端不会重发，状态永久卡住。
-    """
-    from closecrab_avatar.policy import AvatarTarget as T, parse_target
-    for bad in (None, "", "   ", "乱写", "true", "1"):
-        assert parse_target(bad) is T.OFF
+def test_each_role_has_its_own_switch():
+    from closecrab_avatar.policy import AvatarRole as R, ATTR_WANT_BY_ROLE, wanted_roles
+    a = ATTR_WANT_BY_ROLE[R.ASSISTANT]
+    p = ATTR_WANT_BY_ROLE[R.PRINCIPAL]
+    assert wanted_roles({"me": {p: "true"}}) == {R.PRINCIPAL}
+    assert wanted_roles({"me": {a: "true"}}) == {R.ASSISTANT}
+    assert wanted_roles({"me": {a: "true", p: "true"}}) == {R.PRINCIPAL, R.ASSISTANT}
 
 
-def test_room_target_is_stable_under_conflict():
-    """⭐ 两个人选了不同角色时，结果**不能取决于字典顺序**。
-
-    不稳定的话画面会在两个角色之间来回跳，而且复现不了。
-    按 identity 排序取第一个明确表态的：任意但确定。
-    """
-    from closecrab_avatar.policy import ATTR_TARGET, AvatarTarget as T, target_for_room
-    a = {"zoe": {ATTR_TARGET: "principal"}, "amy": {ATTR_TARGET: "assistant"}}
-    b = {"amy": {ATTR_TARGET: "assistant"}, "zoe": {ATTR_TARGET: "principal"}}
-    assert target_for_room(a) is target_for_room(b) is T.ASSISTANT
+def test_nobody_wants_by_default():
+    """老客户端不发这些键 —— 默认开的话每个旧客户端都会去抢一路 GPU。"""
+    from closecrab_avatar.policy import wanted_roles
+    assert wanted_roles({}) == set()
+    assert wanted_roles({"old": {"unrelated": "1"}}) == set()
 
 
-def test_room_target_off_when_nobody_picks():
-    from closecrab_avatar.policy import ATTR_TARGET, AvatarTarget as T, target_for_room
-    assert target_for_room({}) is T.OFF
-    assert target_for_room({"a": {}, "b": {ATTR_TARGET: "off"}}) is T.OFF
+def test_anyone_wanting_counts():
+    """任何一个人要就算要 —— 别让关开关的那个人把别人的画面也掐了。"""
+    from closecrab_avatar.policy import AvatarRole as R, ATTR_WANT_BY_ROLE, wanted_roles
+    p = ATTR_WANT_BY_ROLE[R.PRINCIPAL]
+    assert wanted_roles({"a": {p: "false"}, "b": {p: "true"}}) == {R.PRINCIPAL}
 
 
-def test_target_role_names_match_persona_roles():
-    """⭐ 角色名必须跟形象库那套**完全一致**。
+def test_one_slot_goes_to_principal():
+    """⭐ 只有一路时两个都开 → 给本体。Chris 定的优先级。"""
+    from closecrab_avatar.policy import AvatarRole as R, allocate
+    assert allocate({R.PRINCIPAL, R.ASSISTANT}, capacity=1) == [R.PRINCIPAL]
+    assert allocate({R.ASSISTANT}, capacity=1) == [R.ASSISTANT]
+    assert allocate(set(), capacity=1) == []
 
-    两处各起一套名字的话迟早对不上，而对不上的表现是
-    「换了助手的图，兔子的脸变了」—— 不报错，只是张冠李戴。
-    """
-    from closecrab_avatar.policy import AvatarTarget as T
-    assert {T.ASSISTANT.value, T.PRINCIPAL.value} == {"assistant", "principal"}
+
+def test_two_slots_serve_both_without_protocol_change():
+    """⭐ 以后多一路，**协议一个字不用改** —— 这正是「意图/分配分开」的收益。"""
+    from closecrab_avatar.policy import AvatarRole as R, allocate
+    assert allocate({R.PRINCIPAL, R.ASSISTANT}, capacity=2) == [R.PRINCIPAL, R.ASSISTANT]
+    assert allocate({R.PRINCIPAL, R.ASSISTANT}, capacity=0) == []
+
+
+def test_role_names_match_persona_roles():
+    """角色名必须跟形象库共用一套，否则「换了助手的图，兔子的脸变了」。"""
+    from closecrab_avatar.policy import AvatarRole as R
+    assert {R.ASSISTANT.value, R.PRINCIPAL.value} == {"assistant", "principal"}
