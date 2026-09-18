@@ -148,3 +148,60 @@ def test_process_group_timeout_is_not_the_default():
     src = _src()
     assert "timeout=" in src and "timedelta" in src, \
         "init_process_group 没有显式 timeout —— 空闲 10 分钟后整组会被 NCCL 打掉"
+
+
+# ── ⭐ 会话收尾必须关掉 AvatarRunner ─────────────────────────────────
+
+
+def _run_session_ast():
+    """拿 `_run_session` 的语法树。
+
+    这一条只能用结构断言：真跑一遍要起 LiveKit 房间、网关 HTTP 和五卡模型。
+    而要钉的东西恰恰是结构性的 —— **`finally` 里有没有那一句**。
+    """
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "worker" / "runner.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_session":
+            return ast, node
+    raise AssertionError("找不到 _run_session")
+
+
+def test_session_teardown_closes_the_runner():
+    """⭐ 漏掉这一句的后果不是「多占点内存」，是**画面严重卡顿、一场比一场重**。
+
+    `AvatarRunner` 自己起三条常驻任务，不关就永远活着；而每一场的 generator
+    包的都是**同一个** pipeline source —— 漏下来的消费者会跟当前这一场抢帧，
+    真正在播的那路只拿到 1/N。
+
+    日志指纹：同一毫秒出现 2～3 条**一模一样**的
+    `Frame capture was behind schedule for 4188.51 ms`。一个同步器不可能
+    重复报同一个值，重数就是当时活着的 runner 数。
+    """
+    ast, fn = _run_session_ast()
+    tries = [n for n in ast.walk(fn) if isinstance(n, ast.Try) and n.finalbody]
+    assert tries, "_run_session 连 finally 都没有"
+    closed = any(
+        isinstance(c, ast.Call)
+        and isinstance(c.func, ast.Attribute)
+        and c.func.attr == "aclose"
+        and isinstance(c.func.value, ast.Name)
+        and c.func.value.id == "runner"
+        for t in tries for stmt in t.finalbody for c in ast.walk(stmt)
+    )
+    assert closed, "会话收尾没有 await runner.aclose() —— 会漏 AvatarRunner"
+
+
+def test_runner_is_predeclared_so_finally_cannot_nameerror():
+    """`runner` 在 `try` 里才赋值。**进 try 之前就抛的话 finally 会 NameError** ——
+    而那会把真正的异常盖掉，日志里只剩一句莫名其妙的 NameError。"""
+    ast, fn = _run_session_ast()
+    tries = [n for n in ast.walk(fn) if isinstance(n, ast.Try) and n.finalbody]
+    first_try_line = min(t.lineno for t in tries)
+    pre = [n for n in ast.walk(fn)
+           if isinstance(n, ast.Assign) and n.lineno < first_try_line
+           and any(isinstance(t, ast.Name) and t.id == "runner" for t in n.targets)]
+    assert pre, "runner 没有在 try 之前预先置空"

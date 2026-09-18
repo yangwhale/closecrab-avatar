@@ -175,6 +175,7 @@ class Worker:
         psid = job["provider_session_id"]
         self._active.add(psid)
         room = rtc.Room()
+        runner = None
         try:
             await room.connect(job["livekit_url"], job["room_token"])
             log.info("会话 %s 已进房 %s", psid, job["room_name"])
@@ -244,6 +245,27 @@ class Worker:
             log.exception("会话 %s 异常结束", psid)
         finally:
             self._active.discard(psid)
+            # ⭐⭐ **必须关掉 runner。** 2026-09-18 之前这里漏了，后果不是
+            #    「多占一点内存」，是**画面严重卡顿，而且一场比一场重**：
+            #
+            #    `AvatarRunner` 自己起了三条常驻任务（读音频 / 转发视频 /
+            #    AVSynchronizer 的 `_capture_video`）。不关的话它们**永远活着**，
+            #    而每一场的 generator 包的都是**同一个** pipeline source ——
+            #    于是 N 个漏下来的消费者跟当前这一场抢 `next_frame()`，
+            #    真正在播的那一路只拿到 1/N 的帧。
+            #
+            #    日志里的指纹很清楚：同一毫秒出现 **2～3 条一模一样**的
+            #    `Frame capture was behind schedule for 4188.51 ms` ——
+            #    一个同步器不可能重复报同一个值，那是几个漏下来的实例
+            #    各报各的。重数 ＝ 当时活着的 runner 数。
+            #
+            #    房间 disconnect **救不了**：`_capture_video` 拉的是自己的队列，
+            #    跟房间没关系。
+            if runner is not None:
+                try:
+                    await runner.aclose()
+                except Exception:                    # noqa: BLE001
+                    log.warning("会话 %s 关 runner 失败", psid, exc_info=True)
             if self._source is not None:
                 # 人走了，别让没念完的音频喂给下一场
                 self._source.reset()
