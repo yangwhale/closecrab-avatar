@@ -86,7 +86,25 @@ BODY = f'''                {BEGIN}
                     motion_latents = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)
                     videos_last_frames = motion_latents.detach()
                     motion_latents = torch.stack(self.vae.encode(motion_latents))
-                    print(f"[CC] 换脸生效：{{ref_image_path}}", flush=True)
+                    # ⭐⭐ **注意力缓存也必须清掉，否则新旧两个人会混在一起。**
+                    #
+                    # 上游 `self.kv_cache1 = None` 只在**进循环之前**执行一次，
+                    # 循环里是 `if self.kv_cache1 is None:` 才建 —— 也就是说
+                    # KV cache 和 crossattn cache **只在第一轮建，之后一直沿用**。
+                    #
+                    # 只换参考图的话，缓存里还装着上一个人的注意力状态，模型
+                    # 会把两个人**融**起来。2026-09-18 实测：从兔子换成一张
+                    # 自拍，生成出来是那个人举着手，**手上长着兔耳朵**。
+                    #
+                    # 置 None 之后下一轮会连 crossattn cache 一起重建
+                    #（两者由同一个 if 管），新身份就干净了。
+                    #
+                    # 代价：时序上下文断一次，画面会有一个跳切。换人本来就该跳切。
+                    #
+                    # 五个 rank 走的是同一行，所以不会失步（DiT rank 真的重建，
+                    # VAE rank 上 kv_cache1 本来就恒为 None，行为不变）。
+                    self.kv_cache1 = None
+                    print(f"[CC] 换脸生效（含清缓存）：{{ref_image_path}}", flush=True)
                 {END}
 '''
 
