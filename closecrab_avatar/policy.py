@@ -307,3 +307,32 @@ def allocate(wanted: set[AvatarRole], *, capacity: int = 1) -> list[AvatarRole]:
     资源现状焊进契约。
     """
     return [r for r in ALLOC_PRIORITY if r in wanted][:max(0, capacity)]
+
+
+def avatar_identity(role: AvatarRole, *, prefix: str = "cc-avatar") -> str:
+    """这一路数字人在房间里叫什么。**必须带角色后缀。**
+
+    两路同时在房间里的时候，固定用 `cc-avatar` 会撞名字 —— LiveKit 里
+    identity 是唯一键，撞了的后果是后进的把先进的踢掉，**而且看起来像
+    「切换成功了」**：房间里确实只剩一个数字人，只是不是你以为的那个。
+
+    放在契约层而不是各自拼字符串：bot 建会话时用它、网关派活时用它、
+    iOS 认参与者时也会照着它推 —— 三处各拼一遍迟早有一处写错，
+    而写错的表现是「数字人在房间里但客户端找不到它」。
+    """
+    return f"{prefix}-{role.value}"
+
+
+def role_of_identity(identity: str, *, prefix: str = "cc-avatar") -> AvatarRole | None:
+    """反过来：从 identity 认出角色。认不出来返回 None，**不猜**。
+
+    猜的话（比如「认不出就当 principal」）会在改名或版本不匹配时把两路
+    数字人都算成本体，而那是静默的错位。
+    """
+    head = f"{prefix}-"
+    if not identity.startswith(head):
+        return None
+    try:
+        return AvatarRole(identity[len(head):])
+    except ValueError:
+        return None

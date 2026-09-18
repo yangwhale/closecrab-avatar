@@ -61,3 +61,24 @@ def test_role_names_match_persona_roles():
     """角色名必须跟形象库共用一套，否则「换了助手的图，兔子的脸变了」。"""
     from closecrab_avatar.policy import AvatarRole as R
     assert {R.ASSISTANT.value, R.PRINCIPAL.value} == {"assistant", "principal"}
+
+
+def test_avatar_identity_carries_role():
+    """⭐ 两路同时在房间里不能撞名字 —— identity 是 LiveKit 的唯一键，
+    撞了后进的会把先进的踢掉，而表现看起来像「切换成功」。"""
+    from closecrab_avatar.policy import AvatarRole as R, avatar_identity
+    a, p = avatar_identity(R.ASSISTANT), avatar_identity(R.PRINCIPAL)
+    assert a != p and a.endswith("assistant") and p.endswith("principal")
+
+
+def test_identity_round_trips():
+    from closecrab_avatar.policy import AvatarRole as R, avatar_identity, role_of_identity
+    for r in R:
+        assert role_of_identity(avatar_identity(r)) is r
+
+
+def test_unknown_identity_returns_none_not_a_guess():
+    """认不出来返回 None。猜「当 principal」会把两路都算成本体 —— 静默错位。"""
+    from closecrab_avatar.policy import role_of_identity
+    for bad in ("cc-avatar", "cc-avatar-", "cc-avatar-乱写", "someone-else", ""):
+        assert role_of_identity(bad) is None
