@@ -37,6 +37,10 @@ class FakeSource:
     def inbox(self):
         return self._inbox
 
+    @property
+    def pending(self):
+        return len(self._frames)
+
     def next_frame(self):
         return self._frames.pop(0) if self._frames else None
 
@@ -56,9 +60,24 @@ def pcm_frame(seconds: float, value: int = 1000) -> rtc.AudioFrame:
                           samples_per_channel=n)
 
 
-def make():
+def make(*, preroll=0, max_lead_ms=None):
+    """造一对。
+
+    ⚠️ **默认把抖动缓冲关掉（preroll=0）。** 下面那批用例测的是
+    「交替吐」「不自己节流」「打断清干净」这些**逐帧语义**，它们只塞一两帧；
+    带着默认的半秒门槛会全部卡在「还没攒够」上 —— 红的原因跟它们要测的
+    东西毫无关系。缓冲本身另有专门的用例。
+    """
     src = FakeSource()
-    return src, LiveAvatarGenerator(src)
+    gen = LiveAvatarGenerator(src)
+    gen._preroll = preroll
+    if max_lead_ms is not None:
+        gen._max_lead_s = max_lead_ms / 1000.0
+    else:
+        # 老用例假定音频**不等视频**（那时候就是这么设计的）。给一个大到
+        # 不会触发的领先额度，让它们继续验各自的东西。
+        gen._max_lead_s = 1e9
+    return src, gen
 
 
 async def drain(gen, n, timeout=2.0):
@@ -150,7 +169,7 @@ async def test_clear_buffer_drops_everything():
     src.emit()
 
     gen.clear_buffer()
-    assert gen._audio_out.empty(), "音频队列没清"
+    assert not gen._audio_out, "音频队列没清"
     assert src.resets == 1, "没通知模型丢在途状态"
     assert src.inbox.pending_samples == 0, "PCM 没清 —— 打断后还在念上一句"
     assert src.next_frame() is None, "已生成的帧没丢 —— 打断后嘴还在动"
@@ -222,3 +241,90 @@ async def test_video_still_flows_while_audio_is_backlogged():
     first6 = await drain(gen, 6)
     videos = sum(1 for x in first6 if isinstance(x, rtc.VideoFrame))
     assert videos == 3, f"前 6 帧里只有 {videos} 帧视频 —— 视频被音频挡住了"
+
+
+# ── ⭐ 抖动缓冲：攒够一块再开播 ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_preroll_holds_both_paths_until_buffered():
+    """攒的时候**音频和视频都不吐**。
+
+    只拦视频的话音频会先跑掉半秒 —— 那是拿「不同步」换「不卡顿」，
+    两个毛病换一个。Chris 2026-09-18 报的正是这两个症状同时出现。
+    """
+    src, gen = make(preroll=5)
+    await gen.push_audio(pcm_frame(0.1))
+    src.emit(); src.emit()                     # 只有 2 帧，不够 5
+    got = await drain(gen, 1, timeout=0.3)
+    assert got == [], f"没攒够就开播了：{got}"
+
+    for _ in range(3):
+        src.emit()                             # 凑到 5
+    got = await drain(gen, 2, timeout=1.0)
+    assert got, "攒够了还不开播"
+
+
+@pytest.mark.asyncio
+async def test_preroll_rearms_after_interrupt():
+    """⭐ 打断之后必须**重新攒**。
+
+    不重置 `_rolling` 的话，下一句直接开播、没有任何缓冲 —— 正好退回
+    打断前的卡顿，而且**只在「被打断过」的那几句上出现**，最难复现。
+    """
+    src, gen = make(preroll=3)
+    for _ in range(3):
+        src.emit()
+    await drain(gen, 1, timeout=1.0)
+    assert gen._rolling is True
+
+    gen.clear_buffer()
+    assert gen._rolling is False, "打断后没重新武装，下一句会裸奔"
+
+    src.emit()                                 # 只有 1 帧，不够 3
+    assert await drain(gen, 1, timeout=0.3) == [], "打断后没攒够就又开播了"
+
+
+# ── ⭐ 音画对齐：音频不许领先视频太多 ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_audio_waits_for_video_when_too_far_ahead():
+    """音频领先超过阈值就等一等。
+
+    根因：视频必须等整块算完才存在（一块 12 帧 / 0.48 s），而音频原样直发。
+    不拴住的话声音恒定早半拍 —— Chris 实测 0.5 秒，跟一块的时长对得上。
+    """
+    src, gen = make(preroll=0, max_lead_ms=50)
+    for _ in range(6):                         # 0.6 秒音频，一帧视频都没有
+        await gen.push_audio(pcm_frame(0.1))
+    got = await drain(gen, 6, timeout=0.5)
+    audios = [g for g in got if isinstance(g, rtc.AudioFrame)]
+    # 50 ms 额度 + 一帧 100 ms：最多吐一帧就该停下等视频。
+    assert len(audios) <= 1, f"音频没被拴住，一口气吐了 {len(audios)} 帧"
+
+
+@pytest.mark.asyncio
+async def test_audio_resumes_once_video_catches_up():
+    """反向验证：视频跟上来，音频必须接着走。**只测「会等」不够** ——
+    一个永远不放行的实现也能通过上一条，而那是彻底哑掉。"""
+    src, gen = make(preroll=0, max_lead_ms=50)
+    for _ in range(6):
+        await gen.push_audio(pcm_frame(0.1))
+    await drain(gen, 2, timeout=0.5)
+    for _ in range(30):                        # 1.2 秒视频（25 fps）
+        src.emit()
+    got = await drain(gen, 20, timeout=1.5)
+    assert any(isinstance(g, rtc.AudioFrame) for g in got), "视频跟上了音频还不走"
+
+
+@pytest.mark.asyncio
+async def test_segment_end_is_never_held_back():
+    """`AudioSegmentEnd` 是**标记不是声音**，不受领先额度管。
+
+    压着它只会让「这段说完了」这个信号迟到 —— 而下游靠它收尾。
+    """
+    src, gen = make(preroll=0, max_lead_ms=0)
+    await gen.push_audio(AudioSegmentEnd())
+    got = await drain(gen, 1, timeout=0.5)
+    assert got and isinstance(got[0], AudioSegmentEnd), f"段结束被压住了：{got}"

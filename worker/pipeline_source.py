@@ -122,6 +122,16 @@ class LiveAvatarPipelineSource:
         assert self._inbox is not None, "还没 load()"
         return self._inbox
 
+    @property
+    def pending(self) -> int:
+        """还有多少帧攒着没被取走。给上层做抖动缓冲用。
+
+        `queue.Queue.qsize()` 在多线程下是**近似值**（文档明说）。这里够用：
+        判据是「攒够了没有」，差一两帧无所谓；而要精确就得加锁，
+        那会把模型线程和事件循环绑在一起 —— 为一个阈值判断不值当。
+        """
+        return self._frames.qsize()
+
     def next_frame(self) -> np.ndarray | None:
         try:
             return self._frames.get_nowait()

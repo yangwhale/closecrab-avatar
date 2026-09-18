@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from typing import AsyncIterator, Protocol, Union
 
 import numpy as np
@@ -40,6 +41,23 @@ from .audio_stream import BlockGeometry, PcmInbox
 log = logging.getLogger("closecrab.avatar.generator")
 
 AVOut = Union[rtc.VideoFrame, rtc.AudioFrame, AudioSegmentEnd]
+
+
+def _int_env(name: str, default: int) -> int:
+    """读一个整数旋钮。**读不出来就用默认值，绝不抛。**
+
+    这几个旋钮是给真机 A/B 用的（「看着顺不顺」我这边量不出来），
+    一个手滑的值不该让整场会话起不来。
+    """
+    import os
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("%s=%r 不是整数，用默认 %d", name, raw, default)
+        return default
 
 
 class FrameSource(Protocol):
@@ -63,6 +81,11 @@ class FrameSource(Protocol):
     def inbox(self) -> PcmInbox:
         ...
 
+    @property
+    def pending(self) -> int:
+        """还有多少帧攒着没被取走。"""
+        ...
+
     def next_frame(self) -> np.ndarray | None:
         """取一帧 RGBA `HxWx4`，没有就返回 None。**不能阻塞。**"""
         ...
@@ -81,13 +104,45 @@ class LiveAvatarGenerator(VideoGenerator):
     def __init__(self, source: FrameSource):
         self._src = source
         self._geom = source.geometry
-        self._audio_out: asyncio.Queue[rtc.AudioFrame | AudioSegmentEnd] = asyncio.Queue()
+        # ⚠️ 用 deque 不用 `asyncio.Queue`：我们从不 `await` 取（只 `popleft`），
+        #    而 Queue 唯一多出来的能力就是那个 await。用它反而要靠 `_queue[0]`
+        #    这种私有属性才能看一眼队头 —— 那是随时会碎的。
+        self._audio_out: deque[rtc.AudioFrame | AudioSegmentEnd] = deque()
         # ⭐ 「这一场到底有没有收到音频」必须能从日志一眼看出来。
         #    没有这个计数器的时候，一场没出画面的会话有两种完全不同的解释 ——
         #    音频没进来（上游的事）vs 进来了但没生成（模型的事）—— 而两边
         #    的日志都是**一片空白**，长得一模一样。查这个花了一上午。
         self._audio_frames = 0
         self._audio_seconds = 0.0
+
+        # ── 抖动缓冲与音画对齐（2026-09-18 加，Chris 真机反馈）────────
+        #
+        # 症状两个，根是同一个：
+        #
+        #   跳帧     模型是**一块 12 帧 / 0.48 秒**地出，而下游
+        #            `AVSynchronizer` 的视频队列只有 `int(25×100/1000)=2` 帧
+        #            —— 80 毫秒缓冲。生产刚好是实时速度时没有任何余量，
+        #            块边界一抖消费端就空手，一次断一到三帧。
+        #   音画差   音频这一路**原样直发不等视频**（上面 `push_audio` 里
+        #            那条注释），而视频必须等整块算完才存在。于是声音恒定
+        #            早半拍 —— 实测 0.5 秒，跟一块的 0.48 秒对得上。
+        #
+        # 所以做两件事：**先攒够一块再开播**（给块边界留余量），
+        # 以及**把音频拴在视频上**（领先超过阈值就等一等）。
+        #
+        # 代价是开口晚 0.5 秒左右。这个取舍是明确的：这一路是播报，
+        # 不是实时对话，「稳且对齐」比「早半秒开口」值钱得多。
+        self._preroll = _int_env("CCA_PREROLL_FRAMES", self._geom.fps // 2)
+        """开播前先攒几帧。默认半秒 —— 略多于一块（0.48 s）。"""
+
+        self._max_lead_s = _int_env("CCA_MAX_AUDIO_LEAD_MS", 120) / 1000.0
+        """音频最多领先视频多少。**不能设 0** —— 严格锁死的话视频一卡音频
+        跟着断，而听觉对断音的敏感度远高于对画面卡顿的敏感度。
+        留一点余量：画面偶尔顿一下，声音仍然是连的。"""
+
+        self._rolling = False          # 攒够了没有
+        self._video_out_s = 0.0        # 已吐出去的视频时长
+        self._audio_out_s = 0.0        # 已吐出去的音频时长
 
     @property
     def size(self) -> tuple[int, int]:
@@ -104,7 +159,7 @@ class LiveAvatarGenerator(VideoGenerator):
             # ⭐ 但要**明确放行**那截尾巴：inbox 平时攒够一整块才给模型，
             #    不放行的话最后不足一块的部分会一直卡在缓冲里等下一句。
             self._src.inbox.mark_segment_end()
-            await self._audio_out.put(frame)
+            self._audio_out.append(frame)
             log.info("音频段结束：本场累计 %d 帧 / %.1f s",
                      self._audio_frames, self._audio_seconds)
             return
@@ -119,7 +174,7 @@ class LiveAvatarGenerator(VideoGenerator):
         #   音轨这一份**原样转发** —— 听众听到的是发送方的原始采样率，
         #     而且不等视频（首帧压不下去，卡着等它整句话就晚一拍）
         #   模型这一份**要 16 kHz** —— wav2vec 只吃这个率
-        await self._audio_out.put(frame)
+        self._audio_out.append(frame)
         self._src.inbox.push(np.frombuffer(frame.data, dtype=np.int16),
                              src_rate=frame.sample_rate)
 
@@ -131,12 +186,14 @@ class LiveAvatarGenerator(VideoGenerator):
           2. 还没被模型拉走的 PCM      ┐ 这两样归 source.reset()
           3. 模型侧已生成的在途帧       ┘
         """
-        while not self._audio_out.empty():
-            try:
-                self._audio_out.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._audio_out.clear()
         self._src.reset()
+        # ⚠️ 抖动缓冲的状态也要清。不清的话打断之后 `_rolling` 还是 True，
+        #    下一句**不重新攒**就直接开播 —— 那正好退回打断前的毛病，
+        #    而且只在「被打断过」的那几句上出现，最难复现。
+        self._rolling = False
+        self._video_out_s = 0.0
+        self._audio_out_s = 0.0
 
     # ── 出 ────────────────────────────────────────────────────────
 
@@ -179,15 +236,40 @@ class LiveAvatarGenerator(VideoGenerator):
         > 抽干高优先级的那一路 ＝ 把另一路饿死整整一个批次的时长。
         """
         idle = 1.0 / (self._geom.fps * 4)
+        frame_s = 1.0 / self._geom.fps
         while True:
             sent = False
-            # 音频先于视频 —— 它不能等。但**只拿一帧**，理由见上面。
-            if not self._audio_out.empty():
-                yield self._audio_out.get_nowait()
-                sent = True
+
+            # ── 攒够了才开播 ──
+            # 攒的时候两路都不吐：只拦视频的话音频会先跑掉半秒，
+            # 那是在用「不同步」换「不卡顿」，两个毛病换一个。
+            if not self._rolling:
+                if self._src.pending >= self._preroll:
+                    self._rolling = True
+                    log.info("抖动缓冲攒够 %d 帧（%.0f ms），开播",
+                             self._src.pending, self._preroll * frame_s * 1000)
+                else:
+                    await asyncio.sleep(idle)
+                    continue
+
+            # ── 音频：领先太多就等视频 ──
+            # `AudioSegmentEnd` 不受这条管 —— 它是个标记不是声音，
+            # 压着它只会让「这段说完了」这个信号迟到。
+            if self._audio_out:
+                is_mark = not isinstance(self._audio_out[0], rtc.AudioFrame)
+                if is_mark or self._audio_out_s - self._video_out_s <= self._max_lead_s:
+                    item = self._audio_out.popleft()
+                    if not is_mark:
+                        self._audio_out_s += (item.samples_per_channel
+                                              / item.sample_rate)
+                    yield item
+                    sent = True
+
             if (img := self._src.next_frame()) is not None:
+                self._video_out_s += frame_s
                 yield to_video_frame(img)
                 sent = True
+
             if not sent:
                 await asyncio.sleep(idle)
 
