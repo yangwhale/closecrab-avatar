@@ -86,6 +86,10 @@ class LiveAvatarPipelineSource:
         self._thread: threading.Thread | None = None
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
+        self._frame_seq = 0
+        self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
+        if self._dump_dir:
+            os.makedirs(self._dump_dir, exist_ok=True)
 
     # ── FrameSource 协议 ──────────────────────────────────────────
 
@@ -254,10 +258,40 @@ class LiveAvatarPipelineSource:
                 if item is None:
                     continue             # DiT rank 只 yield None，不出帧
                 for img in self._to_rgba(item):
+                    self._probe(img)
                     self._offer(img)
         except Exception:
             # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
             log.exception("生成中断，这一路退化成只出声")
+
+    def _probe(self, img: np.ndarray) -> None:
+        """量一下**发出去的像素本身**，别只量「有没有帧」。
+
+        ⚠️ 这条是补上一次误判的。上一轮排障我一路在数「有没有视频轨」「有没有
+        帧」，两项都正常，于是判定链路通了 —— 而屏幕上是纯黑。**「帧在流」和
+        「帧上有东西」是两件事**，中间隔着整个模型；只量前者，一个全黑的
+        输出会一路绿灯走到用户眼前。
+
+        代价是每帧三个 numpy 归约（几十微秒，相对 40 ms 的帧间隔可以忽略），
+        而且默认 25 帧才打一行，不刷屏。要看单帧就设 `CCA_FRAME_DUMP=<目录>`。
+        """
+        self._frame_seq += 1
+        rgb = img[..., :3]
+        if self._dump_dir and self._frame_seq <= 8:
+            try:
+                from PIL import Image
+                Image.fromarray(rgb).save(
+                    f"{self._dump_dir}/f{self._frame_seq:04d}.png")
+            except Exception:
+                log.debug("帧转储失败", exc_info=True)
+        if self._frame_seq % 25:
+            return
+        mean = float(rgb.mean())
+        black = float((rgb.max(axis=2) < 16).mean())
+        # 全黑不是「偏暗」，是**另一类故障** —— 单独说出来，别让人去调亮度。
+        tag = "  ⚠️ 基本全黑" if black > 0.9 else ""
+        log.info("帧 #%d  均值=%.1f  标准差=%.1f  黑像素比=%.2f%s",
+                 self._frame_seq, mean, float(rgb.std()), black, tag)
 
     def _offer(self, img: np.ndarray) -> None:
         """塞一帧。满了丢**最旧**的 —— 数字人只有「现在」有意义。"""
