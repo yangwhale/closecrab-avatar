@@ -22,6 +22,37 @@
 
 **改法要求**：不直接改上游仓库，走独立补丁文件，免得上游更新时冲突。
 
+### 精确到行的实现方案（2026-09-18 已定位）
+
+参考图派生出来的状态一共 4 个**局部变量**，全在 Step 1
+（`causal_s2v_pipeline_tpp_blockwise.py` 约 737-760 行）：
+
+```python
+ref_image        = np.array(Image.open(ref_image_path).convert('RGB'))   # 737
+model_pic        = crop_opreat(resize_opreat(Image.fromarray(ref_image)))
+ref_pixel_values = tensor_trans(model_pic).unsqueeze(1).unsqueeze(0) * 2 - 1.0
+ref_pixel_values = ref_pixel_values.to(dtype=self.vae.dtype, device=self.vae.device)
+ref_pixel_values = ref_pixel_values.repeat(1, 1, 5, 1, 1)
+ref_latents      = torch.stack(self.vae.encode(ref_pixel_values))[:, :, 1:]   # 753
+motion_latents   = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)    # 758
+videos_last_frames = motion_latents.detach()
+motion_latents   = torch.stack(self.vae.encode(motion_latents))               # 760
+```
+
+**插入点**：外层 `for r in range(active_nr):`（约 801 行）的**第一行**。
+那里五个 rank 都会走到，且在任何按 rank 分叉之前。
+
+**插入内容**：读换脸文件；变了就把上面那 4 个变量按同样的算式重算一遍，
+然后照常往下跑。`self.vae.encode` 所有 rank 都执行（Step 1 里它就在
+`in_dit_device` 分支之外），所以不引入新的 rank 间差异。
+
+⚠️ 因为它们是**局部变量**，monkeypatch 够不着 —— 必须改源码文本。
+所以走 `.patch` 文件 + 幂等的应用脚本，别用运行时补丁。
+
+⚠️ 还要确认一件事再写：`r == 0` 那几个分支（`ref_latents` 会被替换成
+生成出来的那一帧当 attention sink）跟换脸的交互 —— 换脸之后 sink 该用
+新图还是保持不变，这个要想清楚，不是照抄 Step 1 就完事。
+
 ---
 
 ## 为什么不是别的做法
