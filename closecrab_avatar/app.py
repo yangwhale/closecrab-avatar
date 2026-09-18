@@ -46,6 +46,16 @@ class CreateSessionRequest(BaseModel):
     agent_identity: str
     avatar_id: str | None = None
     image_url: str | None = None
+    # ⚠️ 这两个**必须声明出来**。Pydantic 默认忽略未知字段 —— 没声明的话
+    #    调用方传了也是静默丢掉，网关照用自己的默认值。
+    #    2026-09-18 踩到：agent 侧按 48 kHz 发音频、这里按 16 kHz 建音频源，
+    #    worker 在重新发布时崩在
+    #    `InvalidState - sample_rate and num_channels don't match`，
+    #    而 POST 返回的是 200 —— 参数进了黑洞。
+    #
+    #    采样率**由发送方定**：它才是产音频的那一个。这里只在没给时兜底。
+    sample_rate: int | None = None
+    size: str | None = None
     extra_kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -147,9 +157,9 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
             "agent_identity": body.agent_identity,
             "avatar_id": body.avatar_id,
             "image_url": body.image_url,
-            "size": settings.size,
+            "size": body.size or settings.size,
             "trim_k": settings.trim_k,
-            "sample_rate": settings.sample_rate,
+            "sample_rate": body.sample_rate or settings.sample_rate,
             "extra_kwargs": body.extra_kwargs,
         }
         now = time.time()
@@ -163,7 +173,7 @@ def create_app(settings: Settings, ring: KeyRing) -> FastAPI:
             "session_id": session_id,
             "provider_session_id": provider_session_id,
             "terminate_token": make_terminate_token(api_key.secret, provider_session_id),
-            "sample_rate": settings.sample_rate,
+            "sample_rate": body.sample_rate or settings.sample_rate,
         }
         if idempotency_key:
             store.put_idempotent(idempotency_key, api_key.key_id, result)

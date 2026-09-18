@@ -101,10 +101,13 @@ class LiveAvatarGenerator(VideoGenerator):
             await self._audio_out.put(frame)
             return
 
-        # 音频原样转发，**不等视频**。首帧压不下去，卡着等它整句话就晚一拍；
-        # 声音先到一点点反而没人察觉。
+        # 两条路要的东西不一样，别合并：
+        #   音轨这一份**原样转发** —— 听众听到的是发送方的原始采样率，
+        #     而且不等视频（首帧压不下去，卡着等它整句话就晚一拍）
+        #   模型这一份**要 16 kHz** —— wav2vec 只吃这个率
         await self._audio_out.put(frame)
-        self._src.inbox.push(np.frombuffer(frame.data, dtype=np.int16))
+        self._src.inbox.push(np.frombuffer(frame.data, dtype=np.int16),
+                             src_rate=frame.sample_rate)
 
     def clear_buffer(self) -> None:
         """被打断。**把所有在途的东西一次丢干净。**

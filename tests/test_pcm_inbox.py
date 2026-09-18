@@ -220,3 +220,53 @@ def test_no_samples_lost_under_concurrent_push_and_pull():
 
     assert seen == total_pushed, \
         f"并发下样本对不上：推了 {total_pushed}，拉到 {seen}（差 {total_pushed - seen}）"
+
+
+# ── ⭐ 重采样：房间是 48k，模型要 16k ──────────────────────────────
+
+def test_push_resamples_to_model_rate():
+    """⭐ 这条是线上崩出来的那个 bug 的另一半。
+
+    房间里的音频率由发送方定（bot 这条是 48 kHz），而模型侧 wav2vec 要
+    16 kHz。不转就是把 48k 的数据按 16k 解读 —— 一块只装得下三分之一的
+    真实时长，口型跟声音差三倍，**而且不报错**。
+    """
+    box = make()
+    box.push(i16(48000), src_rate=48000)          # 1 秒 48k
+    assert box.pending_samples == 16000, "没转成 16k"
+
+
+def test_push_without_src_rate_assumes_model_rate():
+    """不给 src_rate 就当它已经是模型率 —— 老调用方不受影响。"""
+    box = make()
+    box.push(i16(16000))
+    assert box.pending_samples == 16000
+
+
+def test_integer_ratio_downsample_is_low_passed():
+    """⭐ 48k→16k 是整数 3:1，走「先平均再抽」。
+
+    直接抽点会把高频折回来变成嘶声，而 wav2vec 对这个敏感。
+    判据：拿一个 3 个采样一组、组内均值为 0 的信号，降采样后应接近 0；
+    直接抽点则会原样保留其中一个尖峰。
+    """
+    from worker.audio_stream import resample_i16
+    pcm = np.tile(np.array([3000, -3000, 0], dtype=np.int16), 100)
+    out = resample_i16(pcm, 48000, 16000)
+    assert out.size == 100
+    assert abs(int(out.max())) < 100, f"没做低通，峰值 {out.max()}"
+
+
+def test_non_integer_ratio_falls_back_to_interp():
+    """非整数倍（比如 44.1k→16k）退回线性插值，长度要对得上。"""
+    from worker.audio_stream import resample_i16
+    out = resample_i16(i16(44100), 44100, 16000)
+    assert abs(out.size - 16000) <= 1
+
+
+def test_resample_handles_empty_and_tiny_input():
+    """半包音频不能把它搞崩 —— LiveKit 的包大小不保证对齐。"""
+    from worker.audio_stream import resample_i16
+    assert resample_i16(np.zeros(0, dtype=np.int16), 48000, 16000).size == 0
+    assert resample_i16(i16(2), 48000, 16000).size == 0      # 不足一组，丢掉
+    assert resample_i16(i16(3), 48000, 16000).size == 1

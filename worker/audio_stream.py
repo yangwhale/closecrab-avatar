@@ -76,6 +76,26 @@ class BlockGeometry:
         return int(self.sample_rate * self.block_seconds)
 
 
+def resample_i16(pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """int16 单声道重采样。
+
+    整数倍降采样（48k→16k 正好 3:1）走**先平均再抽**，那个平均就是一个最
+    简单的低通 —— 直接抽点会把高频折回来变成嘶声，而 wav2vec 对这个敏感。
+    非整数倍退回线性插值：够用，也不值得为它引一个 scipy。
+    """
+    if src_rate == dst_rate or pcm.size == 0:
+        return pcm
+    if src_rate % dst_rate == 0:
+        k = src_rate // dst_rate
+        n = (pcm.size // k) * k
+        if n == 0:
+            return pcm[:0]
+        return pcm[:n].astype(np.int32).reshape(-1, k).mean(axis=1).astype(np.int16)
+    out_n = max(1, int(round(pcm.size * dst_rate / src_rate)))
+    idx = np.linspace(0, pcm.size - 1, out_n)
+    return np.interp(idx, np.arange(pcm.size), pcm.astype(np.float32)).astype(np.int16)
+
+
 class PcmInbox:
     """模型来拉音频的地方。**一端事件循环写，一端模型线程读。**
 
@@ -120,7 +140,15 @@ class PcmInbox:
 
     # ── 事件循环那一侧 ──────────────────────────────────────────────
 
-    def push(self, pcm_i16: np.ndarray) -> None:
+    def push(self, pcm_i16: np.ndarray, *, src_rate: int | None = None) -> None:
+        """喂一段 PCM。**给了 `src_rate` 就自动重采样到模型要的那个率。**
+
+        ⚠️ 这一步不能省。房间里的音频是发送方定的率（我们这条是 48 kHz），
+        而模型那侧的 wav2vec **要 16 kHz**。不转就是把 48 k 的数据按 16 k 解读 ——
+        块长算出来只有实际的三分之一，口型跟声音差三倍，**而且不报错**。
+        """
+        if src_rate and src_rate != self._geom.sample_rate:
+            pcm_i16 = resample_i16(pcm_i16, src_rate, self._geom.sample_rate)
         with self._cv:
             self._buf.append(pcm_i16)
             self._pending += len(pcm_i16)
