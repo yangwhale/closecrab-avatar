@@ -72,6 +72,22 @@ sudo systemctl restart closecrab-avatar
 
 模型权重不用备份 —— 47 GB，从 HF 重拉比恢复快。
 
+## 画面出来了但不对劲
+
+「有帧」和「帧是对的」是两件事，而**大部分这类故障总时长完全正确**，
+健康检查一路绿灯。按现象查：
+
+| 现象 | 先看哪 |
+|---|---|
+| 口型对不上 / 不够顺 / 嘴部规律抽动 | [lip-sync.md](lip-sync.md) |
+| 换了形象不生效、两张脸混在一起 | [face-swap.md](face-swap.md) |
+| 卡顿，而且一场比一场重 | 漏掉的 `AvatarRunner`，日志里找同一毫秒重复 N 条 `Frame capture was behind schedule` |
+| 重播之后彻底没画面 | 那条字节流成了死流，见 `closecrab_avatar/audio_sink.py` |
+| 纯黑画面 | 不是「偏暗」，是另一类故障。`closecrab.avatar.pipeline` 每 25 帧打一行黑像素比 |
+
+要把「生成 / 传输 / 客户端」三者分开，用 `CCA_AV_DUMP` 落盘再
+`scripts/mux-av-dump.sh` 合成 —— 落的是**递交给 LiveKit 之前**的裸流。
+
 ## 日志级别的规矩
 
 **日志级别是给下游机器看的判据，不是给人看的语气。**
