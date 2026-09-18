@@ -32,6 +32,7 @@ import numpy as np
 from livekit import rtc
 from livekit.agents.voice.avatar import AvatarOptions, AvatarRunner, DataStreamAudioReceiver
 
+from .publish_opts import TunedAvatarRunner
 from .generators import StaticImageGenerator
 
 # ⚠️ **顶层不 import torch，也不 import 任何拖 torch 的东西。**
@@ -150,7 +151,10 @@ class Worker:
                 log.warning("会话 %s **退回静帧** —— 这台没有可用模型，"
                             "起动时的 warning 里写了是哪一条不满足", psid)
 
-            runner = AvatarRunner(
+            # ⚠️ 用 TunedAvatarRunner 不用 AvatarRunner —— 库里那个发布视频轨时
+            #    **一个编码参数都不传**，拿到的默认值对着手机是坏的。理由见
+            #    `publish_opts.py`。
+            runner = TunedAvatarRunner(
                 room,
                 audio_recv=DataStreamAudioReceiver(room, sender_identity=job["agent_identity"]),
                 video_gen=gen,
