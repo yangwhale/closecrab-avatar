@@ -46,6 +46,11 @@ log = logging.getLogger("liveavatar.worker")
 HEARTBEAT_S = 10.0
 RECONNECT_BACKOFF_S = 3.0
 
+# 换脸：把新图路径写进这个文件，**上游补丁**会在下一轮开头读它并就地换掉
+# 参考图那几个张量（见 scripts/patch-upstream-faceswap.py 和 docs/face-swap.md）。
+# worker 这边只负责「把图放好、把路径写上」，换的动作在模型循环里。
+_FACE_FILE = os.environ.get("CCA_FACE_FILE", "/tmp/cca-current-face.txt")
+
 
 def _load_image(path: str | None, size: tuple[int, int]) -> np.ndarray:
     w, h = size
@@ -74,6 +79,7 @@ class Worker:
         self._image_path = image_path
         self._source = source
         self._active: set[str] = set()
+        self._face_version: str | None = None
 
     async def run(self) -> None:
         async with aiohttp.ClientSession() as http:
@@ -125,6 +131,46 @@ class Worker:
             if job:
                 asyncio.create_task(self._run_session(http, job))
 
+    async def _apply_persona(self, http: aiohttp.ClientSession, job: dict) -> None:
+        """把这一场该用的脸取下来、写进换脸文件。**只做这两件事。**
+
+        真正的切换由上游补丁在生成循环里完成（下一轮开头就地重算参考图张量），
+        这边不碰模型、不发信号、不重启任何东西。
+
+        没设过形象图是正常状态，不是故障：一声不吭地继续用当前那张。
+        """
+        ver, url = job.get("persona_version"), job.get("persona_url")
+        if not ver or not url or ver == self._face_version:
+            return
+        try:
+            async with http.get(f"{self._gw}{url}",
+                                timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    log.warning("取形象图失败 %s —— 继续用当前这张", r.status)
+                    return
+                data = await r.read()
+                ext = {"image/png": ".png", "image/webp": ".webp"}.get(
+                    r.headers.get("Content-Type", ""), ".jpg")
+        except Exception as e:                        # noqa: BLE001
+            # 取不到图**不能让会话起不来** —— 旧脸总比没脸好。
+            log.warning("取形象图出错（%s）—— 继续用当前这张", e)
+            return
+        img = f"/tmp/cca-face-{job.get('persona_role', 'principal')}-{ver}{ext}"
+        try:
+            with open(img, "wb") as f:
+                f.write(data)
+            # 原子写：模型循环随时可能在读，写一半被读到会拿到半个路径。
+            tmp = _FACE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(img)
+            os.replace(tmp, _FACE_FILE)
+        except OSError as e:
+            log.warning("形象图落盘失败（%s）—— 继续用当前这张", e)
+            return
+        self._face_version = ver
+        log.info("换脸：角色=%s 版本=%s → %s（下一轮生效）",
+                 job.get("persona_role"), ver, img)
+
     async def _run_session(self, http: aiohttp.ClientSession, job: dict) -> None:
         psid = job["provider_session_id"]
         self._active.add(psid)
@@ -140,6 +186,7 @@ class Worker:
                 w, h = self._source.size
                 gen = LiveAvatarGenerator(self._source)
                 fps = self._source.geometry.fps
+                await self._apply_persona(http, job)
                 # 上一场可能留下半句话没念完的 PCM —— 新会话从干净状态开始。
                 self._source.reset()
                 log.info("会话 %s 用真模型（%d×%d @ %d fps）", psid, w, h, fps)
