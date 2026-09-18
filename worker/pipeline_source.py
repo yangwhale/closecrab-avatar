@@ -243,7 +243,25 @@ class LiveAvatarPipelineSource:
         # 建一个独立的组就把这整类风险切断了：两个组的配对各算各的。
         # `new_group()` 必须**所有 rank 都调、且顺序一致** —— 放在 load() 里
         # 正好满足（五个 rank 都会走到这儿，且只走一次）。
-        self._ctrl_group = dist.new_group(ranks=list(range(world)))
+        # ⚠️ **建组之前必须先把当前 CUDA 设备绑到本 rank。**
+        #    不绑的话每个进程的「当前设备」都是 cuda:0，NCCL 建组时会报
+        #      Duplicate GPU detected : rank 0 and rank 4 both on CUDA device ...
+        #      NCCL error ... invalid usage
+        #    然后打死一个 rank。实测就是这么挂的（2026-09-18）。
+        #
+        #    默认组之所以没事，是它在 `init_process_group()` 时建的 —— 那时
+        #    torchrun 刚设过 LOCAL_RANK 的设备上下文。**后建的组不继承那个前提。**
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
+        # ⚠️ **建组失败不能把 worker 带走。** 这是一个可选功能的辅助设施，
+        #    它挂了最多是「换不了脸」，不该变成「整台机器不出画面」。
+        #    今天已经因为「一个开关把服务弄停了」返工过一次。
+        try:
+            self._ctrl_group = dist.new_group(ranks=list(range(world)))
+        except Exception:                                  # noqa: BLE001
+            self._ctrl_group = None
+            log.exception("换脸专用通信组建不起来 —— 换脸功能停用，其余照常")
 
         self._pipe = pipe
         log.info("rank %d/%d 模型就绪（%s）", rank, world,
