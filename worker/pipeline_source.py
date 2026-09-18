@@ -286,6 +286,20 @@ class LiveAvatarPipelineSource:
             return
         log.info("换脸请求已落盘：%s（下一个重开边界生效）", path)
 
+    def _face_changed_on_disk(self) -> bool:
+        """换脸文件里的图跟现在用的这张是不是不一样。**只读不改。**
+
+        真正改 `_cfg` 的是 `_adopt_pending_face()`，在重开之前调 —— 读和改
+        分开，是为了让「要不要重开」这个判断没有副作用：它在五个 rank 上
+        每个检查点都会跑，带副作用的话很难推演。
+        """
+        try:
+            with open(_FACE_FILE, encoding="utf-8") as f:
+                path = f.read().strip()
+        except OSError:
+            return False
+        return bool(path) and path != self._cfg["ref_image_path"] and os.path.exists(path)
+
     def _adopt_pending_face(self) -> None:
         """重开之前读一次换脸文件。**每个 rank 各读各的，不互相商量。**"""
         try:
@@ -355,7 +369,20 @@ class LiveAvatarPipelineSource:
             #    在不同的块上跳出去 —— 那正是要避免的死锁。
             blocks += 1
             if blocks >= self._restart_every:
-                return
+                # ⭐ **到了检查点，但只有脸真的换了才重开。**
+                #
+                # 实测一次重入要付约 3.4 秒（17.7 秒音频里重入 3 次，出帧从
+                # 444 掉到 188，帧率 22 → 18.3）—— 我原先估「约 1 秒」是错的。
+                # 无条件重开的话，12 秒一次等于常态损失近三成的帧。
+                #
+                # 所以把「多久检查一次」和「要不要重开」分开：
+                #   检查很便宜（读一个小文件），可以频繁；
+                #   重开很贵，只在真换脸时做。
+                # 每个 rank 在**同一个块**上读**同一个文件**，所以答案一致 ——
+                # 依然零协调。
+                blocks = 0
+                if self._face_changed_on_disk():
+                    return
             if item is None:
                 continue                 # DiT rank 只 yield None，不出帧
             for img in self._to_rgba(item):
