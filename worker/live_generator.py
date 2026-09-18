@@ -37,6 +37,7 @@ from livekit import rtc
 from livekit.agents.voice.avatar import AudioSegmentEnd, VideoGenerator
 
 from .audio_stream import BlockGeometry, PcmInbox
+from .av_dump import AVDump
 
 log = logging.getLogger("closecrab.avatar.generator")
 
@@ -171,6 +172,9 @@ class LiveAvatarGenerator(VideoGenerator):
         只能靠眼睛看嘴型 —— 而那正是我之前拍一个 120 毫秒出来的原因。
         """
 
+        # 排障用的离线录制。默认不开，开关见 `av_dump.AVDump`。
+        self._dump = AVDump(self._geom.fps, source.size)
+
         self._rolling = False          # 攒够了没有
         self._video_out_s = 0.0        # 已吐出去的视频时长
         self._audio_out_s = 0.0        # 已吐出去的音频时长
@@ -191,6 +195,7 @@ class LiveAvatarGenerator(VideoGenerator):
             #    不放行的话最后不足一块的部分会一直卡在缓冲里等下一句。
             self._src.inbox.mark_segment_end()
             self._audio_out.append(frame)
+            self._dump.close()
             log.info("音频段结束：本场累计 %d 帧 / %.1f s；"
                      "音画对齐实测最大偏差 %.0f ms（额度 %.0f ms）",
                      self._audio_frames, self._audio_seconds,
@@ -302,12 +307,17 @@ class LiveAvatarGenerator(VideoGenerator):
                     if not is_mark:
                         self._audio_out_s += (item.samples_per_channel
                                               / item.sample_rate)
+                        self._dump.audio(bytes(item.data),
+                                         sample_rate=item.sample_rate,
+                                         num_channels=item.num_channels)
                     yield item
                     sent = True
 
             if (img := self._src.next_frame()) is not None:
                 self._video_out_s += frame_s
-                yield to_video_frame(img)
+                vf = to_video_frame(img)
+                self._dump.video(bytes(vf.data))
+                yield vf
                 sent = True
 
             if not sent:
