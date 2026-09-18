@@ -94,6 +94,8 @@ class LiveAvatarPipelineSource:
         self._face_lock = threading.Lock()
         self._pending_face: str | None = None
         self._vae_rank = 0
+        # 换脸标志位专用的通信组，在 load() 里建。见那里的注释。
+        self._ctrl_group = None
         self._frame_seq = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
@@ -227,6 +229,22 @@ class LiveAvatarPipelineSource:
             log.info("出帧尺寸 %d×%d（请求 %s，按 64 的网格取整）",
                      w, h, self._cfg["size"])
 
+        # ⭐⭐ **换脸的标志位走一个专用通信组，绝不能借默认组。**
+        #
+        # 上游 `generate()` 在默认组里本来就有一对**不对称**的 broadcast：
+        #   · DiT rank 在 `r==0 / r==1` 的轮次开头收（`rank != vae_rank` 分支）
+        #   · VAE rank 在 `r==0` 最后一个 block 发
+        # 也就是说同一个组里，不同 rank 在**完全不同的位置**发起集合通信，
+        # 全靠「每个组内按发起顺序配对」这条规则才对得上。
+        #
+        # 我再往这个组里插一个「每块一次」的 broadcast，就会跟上游那两个
+        # 抢着配对 —— 轻则读到别人的张量，重则整组死等。**而且不报错。**
+        #
+        # 建一个独立的组就把这整类风险切断了：两个组的配对各算各的。
+        # `new_group()` 必须**所有 rank 都调、且顺序一致** —— 放在 load() 里
+        # 正好满足（五个 rank 都会走到这儿，且只走一次）。
+        self._ctrl_group = dist.new_group(ranks=list(range(world)))
+
         self._pipe = pipe
         log.info("rank %d/%d 模型就绪（%s）", rank, world,
                  "VAE：拉音频 + 出帧" if self._is_vae_rank else "DiT：纯算")
@@ -303,12 +321,16 @@ class LiveAvatarPipelineSource:
             with self._face_lock:
                 return self._pending_face is not None
 
+        if self._ctrl_group is None:
+            # 组还没建就别发集合通信 —— 借默认组正是这里要避免的事。
+            return False
+
         flag = torch.zeros(1, dtype=torch.int32, device="cuda")
         if self._is_vae_rank:
             with self._face_lock:
                 flag[0] = 1 if self._pending_face is not None else 0
         # src 必须是 VAE rank 的全局 rank —— 它是唯一知道会话的那个。
-        dist.broadcast(flag, src=self._vae_rank)
+        dist.broadcast(flag, src=self._vae_rank, group=self._ctrl_group)
         if int(flag[0]) == 0:
             return False
 
@@ -319,7 +341,7 @@ class LiveAvatarPipelineSource:
             with self._face_lock:
                 raw = (self._pending_face or "").encode()[:512]
             buf[:len(raw)] = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
-        dist.broadcast(buf, src=self._vae_rank)
+        dist.broadcast(buf, src=self._vae_rank, group=self._ctrl_group)
         path = bytes(buf.cpu().numpy()).rstrip(b"\x00").decode(errors="replace")
         if path:
             self._cfg["ref_image_path"] = path
