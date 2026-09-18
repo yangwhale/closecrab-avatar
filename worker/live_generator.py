@@ -135,10 +135,41 @@ class LiveAvatarGenerator(VideoGenerator):
         self._preroll = _int_env("CCA_PREROLL_FRAMES", self._geom.fps // 2)
         """开播前先攒几帧。默认半秒 —— 略多于一块（0.48 s）。"""
 
-        self._max_lead_s = _int_env("CCA_MAX_AUDIO_LEAD_MS", 120) / 1000.0
-        """音频最多领先视频多少。**不能设 0** —— 严格锁死的话视频一卡音频
-        跟着断，而听觉对断音的敏感度远高于对画面卡顿的敏感度。
-        留一点余量：画面偶尔顿一下，声音仍然是连的。"""
+        self._max_lead_s = _int_env(
+            "CCA_MAX_AUDIO_LEAD_MS", round(1000 / self._geom.fps)) / 1000.0
+        """音频最多领先视频多少。**默认就是一帧的时长**（25 fps ＝ 40 ms）。
+
+        ## 为什么这里能严格对齐，而且不用知道生成延迟
+
+        > Chris 2026-09-18：「真正对得齐的是音频第一帧和视频第一帧，它俩
+        > 100% 一样。对齐以后后续的帧逐渐累加就行……不能靠猜。」
+
+        对的，而且这条在我们这儿成立得很干净：模型**一块吃 0.48 秒音频、
+        吐 12 帧**，而 12 ÷ 25 fps 正好也是 0.48 秒。两条媒体时间轴
+        **天生等长，不会漂**。
+
+        所以对齐只需要两件事，一件都不用猜：
+
+            锚点   攒够之后第一次循环里，音频第一帧和视频第一帧一起出去
+            步进   之后各按自己的时长累加，谁跑快了谁等
+
+        生成延迟是 0.5 秒还是 0.9 秒、换张卡快了慢了 —— **完全不参与**。
+        它只影响「锚点什么时候到」，不影响锚上之后的对齐。这也是为什么
+        预缓冲是「等帧真的出现」而不是「等一个估出来的毫秒数」。
+
+        额度取一帧而不是 0 —— 但理由要说准：**0 也能走**（实测过，两边会
+        严格交替，一帧换一帧）。取一帧是为了让「同一时刻的音频和视频」能在
+        **同一轮**里一起出去，而不是音频永远晚半帧跟在视频屁股后面。
+
+        ⚠️ 它**不是给生成延迟留的余量**。延迟由预缓冲吸收，跟这个数无关。
+        """
+
+        self._max_drift = 0.0
+        """本段实测的最大对齐误差。**要量，不要猜。**
+
+        这个数会在段落结束时打进日志。没有它的话，「对齐做对了没有」这件事
+        只能靠眼睛看嘴型 —— 而那正是我之前拍一个 120 毫秒出来的原因。
+        """
 
         self._rolling = False          # 攒够了没有
         self._video_out_s = 0.0        # 已吐出去的视频时长
@@ -160,8 +191,10 @@ class LiveAvatarGenerator(VideoGenerator):
             #    不放行的话最后不足一块的部分会一直卡在缓冲里等下一句。
             self._src.inbox.mark_segment_end()
             self._audio_out.append(frame)
-            log.info("音频段结束：本场累计 %d 帧 / %.1f s",
-                     self._audio_frames, self._audio_seconds)
+            log.info("音频段结束：本场累计 %d 帧 / %.1f s；"
+                     "音画对齐实测最大偏差 %.0f ms（额度 %.0f ms）",
+                     self._audio_frames, self._audio_seconds,
+                     self._max_drift * 1000, self._max_lead_s * 1000)
             return
 
         self._audio_frames += 1
@@ -194,6 +227,7 @@ class LiveAvatarGenerator(VideoGenerator):
         self._rolling = False
         self._video_out_s = 0.0
         self._audio_out_s = 0.0
+        self._max_drift = 0.0
 
     # ── 出 ────────────────────────────────────────────────────────
 
@@ -239,6 +273,12 @@ class LiveAvatarGenerator(VideoGenerator):
         frame_s = 1.0 / self._geom.fps
         while True:
             sent = False
+            # ⚠️ 在**循环开头**量，不是末尾。末尾量的话每次 `yield` 之后
+            #    生成器就挂起了，那一行常常根本跑不到 —— 于是偏差永远是 0，
+            #    一个「测量」变成了一句安慰。
+            drift = abs(self._audio_out_s - self._video_out_s)
+            if drift > self._max_drift:
+                self._max_drift = drift
 
             # ── 攒够了才开播 ──
             # 攒的时候两路都不吐：只拦视频的话音频会先跑掉半秒，

@@ -328,3 +328,69 @@ async def test_segment_end_is_never_held_back():
     await gen.push_audio(AudioSegmentEnd())
     got = await drain(gen, 1, timeout=0.5)
     assert got and isinstance(got[0], AudioSegmentEnd), f"段结束被压住了：{got}"
+
+
+# ── ⭐ 对齐靠时间轴累加，不靠猜生成延迟 ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_first_audio_and_first_video_leave_together():
+    """⭐ 锚点：攒够之后，**音频第一帧和视频第一帧在同一轮出去**。
+
+    Chris 2026-09-18：「真正对得齐的是音频第一帧和视频第一帧，它俩 100%
+    一样。对齐以后后续的帧逐渐累加就行。」
+
+    这一条钉的就是那个锚点。锚错了后面累加得再准也是整体平移。
+    """
+    src, gen = make(preroll=2)                 # 用默认额度（一帧）
+    gen._max_lead_s = LiveAvatarGenerator(FakeSource())._max_lead_s
+    for _ in range(4):
+        await gen.push_audio(pcm_frame(0.04))  # 每帧 40 ms，跟视频一帧等长
+    src.emit(); src.emit()
+    got = await drain(gen, 2, timeout=1.0)
+    kinds = [type(g).__name__ for g in got]
+    assert "AudioFrame" in kinds and "VideoFrame" in kinds, \
+        f"第一轮没有同时放出音频和视频：{kinds}"
+
+
+@pytest.mark.asyncio
+async def test_alignment_does_not_drift_over_many_blocks():
+    """⭐ 步进：跑很多帧之后偏差**不累积**。
+
+    模型一块吃 0.48 秒音频、吐 12 帧，而 12÷25 也是 0.48 秒 —— 两条时间轴
+    天生等长。所以只要各按自己的时长累加，偏差就该一直被压在一帧之内，
+    **跟生成延迟是 0.5 秒还是 0.9 秒毫无关系**。
+
+    这一条是反「靠猜」的：如果哪天有人把额度改回一个拍脑袋的大常数，
+    这里的偏差就会涨上去。
+    """
+    # ⚠️ **不覆盖额度，用代码里的真默认值。** 覆盖了的话这条就只验「我传的
+    #    数管不管用」，验不到「默认值是不是个拍脑袋的大常数」—— 做变异时
+    #    把默认改成 500 ms，这条照样全绿，等于没测到要害。
+    src = FakeSource()
+    gen = LiveAvatarGenerator(src)
+    gen._preroll = 0
+    # ⚠️ **音频管够、视频稀缺** —— 这是唯一能触发额度的形态。
+    #    两边都备齐的话它们天然锁步，额度设成 500 ms 也照样绿，
+    #    那条用例就测了个寂寞（做变异时发现的）。
+    for _ in range(50):
+        await gen.push_audio(pcm_frame(0.04))
+    for _ in range(5):
+        src.emit()
+    await drain(gen, 60, timeout=2.0)
+    assert gen._max_drift <= 2 / G.fps, \
+        f"跑了 50 帧偏差涨到 {gen._max_drift*1000:.0f} ms —— 在漂"
+
+
+@pytest.mark.asyncio
+async def test_drift_is_measured_not_assumed():
+    """偏差必须被**记下来**。没有这个数，「对齐做对没有」只能靠眼睛看嘴型
+    —— 而那正是当初拍一个 120 毫秒出来的原因。"""
+    src, gen = make(preroll=0)
+    gen._max_lead_s = 1 / G.fps
+    await gen.push_audio(pcm_frame(0.2))       # 一口气 200 ms，先跑在前面
+    # ⚠️ 要多转一圈。偏差是在**循环开头**量的，而第一圈开头两边都还是 0 ——
+    #    音频是在那一圈里才吐出去的。只转一圈的话量到的永远是 0，
+    #    这条用例会变成一句「它没报错」而不是「它真的在量」。
+    await drain(gen, 2, timeout=0.3)
+    assert gen._max_drift > 0, "跑偏了却没记下来"
