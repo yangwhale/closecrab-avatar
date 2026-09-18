@@ -397,27 +397,31 @@ async def test_drift_is_measured_not_assumed():
 
 
 @pytest.mark.asyncio
-async def test_pairs_two_20ms_audio_with_one_40ms_video():
-    """⭐ Chris 2026-09-18 的原话：「音频一帧 20 毫秒，两帧 40 毫秒；视频一帧
-    40 毫秒。这两个算一对，两边都凑够 40 毫秒了才能发。」
+async def test_emission_ratio_tracks_frame_durations():
+    """⭐ 「凑够一对才发」—— 但配的是**时长**，不是个数。
 
-    这条就是把那个说法直接钉下来：喂 20 ms 的音频帧和 25 fps 的视频，
-    放出来的**比例必须是 2:1**。
+    > Chris 2026-09-18：「音频一帧 20 毫秒，两帧 40 毫秒；视频一帧 40 毫秒。
+    > 这两个算一对，两边都凑够 40 毫秒了才能发。」
 
-    ⚠️ 代码里不是数个数，是**按时长记账**（累计秒数之差不超过一帧）。
-    两者在这个场景下等价，而记账法多一层保险：TTS 哪天把帧长改成 10 ms
-    或者模型换成 30 fps，2:1 就错了，记账法自己跟着变。
+    规则对，但比例不能写死。**实测 worker 这边收到的音频帧是 100 ms 一帧**
+    （发送侧是 20 ms 一帧，中间经过字节流重组，到这儿变成 100 ms）——
+    所以真实配比是 1 帧音频配 2.5 帧视频，不是 2:1。写死 2:1 就错了。
+
+    代码按累计时长记账，自动适配任何帧长。这条用例就用真实的 100 ms 音频帧
+    验它：**取前一段来数**，数全量的话不管什么节奏比例都对，测了个寂寞
+    （上一版就是这么废掉的，做变异时两条都漏）。
     """
     src = FakeSource()
     gen = LiveAvatarGenerator(src)
     gen._preroll = 0
-    for _ in range(40):
-        await gen.push_audio(pcm_frame(0.02))      # 20 ms 一帧
     for _ in range(20):
-        src.emit()                                 # 40 ms 一帧（25 fps）
-    got = await drain(gen, 60, timeout=2.0)
+        await gen.push_audio(pcm_frame(0.1))       # 100 ms，跟线上实测一致
+    for _ in range(60):
+        src.emit()                                 # 40 ms（25 fps）
+    got = await drain(gen, 30, timeout=2.0)        # ⭐ 只取前 30 个
     a = sum(1 for g in got if isinstance(g, rtc.AudioFrame))
     v = sum(1 for g in got if isinstance(g, rtc.VideoFrame))
-    assert v > 5, f"视频没走起来：{v}"
-    # 允许 ±1 的收尾零头，但比例必须在 2:1 附近，不能是 1:1 或 4:1。
-    assert abs(a - 2 * v) <= 2, f"配对比例不对：音频 {a} 帧 / 视频 {v} 帧"
+    assert a and v, f"有一路没走：音频 {a} 视频 {v}"
+    # 时长必须配得上：音频 a×100ms ≈ 视频 v×40ms，误差不超过两帧视频。
+    assert abs(a * 0.1 - v * 0.04) <= 0.08, \
+        f"配比不对：音频 {a} 帧（{a*0.1:.2f}s）/ 视频 {v} 帧（{v*0.04:.2f}s）"
