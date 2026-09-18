@@ -71,6 +71,7 @@ sudo systemctl enable --now closecrab-avatar-worker@0     # 一卡一个进程
 | GPU 机器装不起来 / 版本对不上 | [gpu-setup.md](docs/gpu-setup.md) |
 | 能跑多快、几路并发 | [benchmarks.md](docs/benchmarks.md) |
 | 上线之后怎么看、怎么修 | [operations.md](docs/operations.md) |
+| **给数字人挑一张什么样的照片** | [reference-image.md](docs/reference-image.md) |
 | **口型对不上 / 不够顺** | [lip-sync.md](docs/lip-sync.md) |
 | 换形象、两张脸混在一起 | [face-swap.md](docs/face-swap.md) |
 | 为什么是这个架构 | [architecture.md](docs/architecture.md) |
