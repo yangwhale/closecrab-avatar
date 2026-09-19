@@ -219,6 +219,59 @@ def test_clear_drops_everything_and_keeps_block_numbers_monotonic():
     assert led.reconciled
 
 
+# ── 换形象：生成器从头开始 ────────────────────────────────────────
+
+def test_restart_reenters_warmup_so_preset_frames_are_not_flagged():
+    """⭐⭐ 换形象之后上游会**再预热一遍**，那批帧必须当预热扔掉。
+
+    第一版把「是不是预热」写成 `blocks_pulled == 0` —— 换形象时
+    `blocks_pulled` 早就不是 0，于是新一轮预热帧全被判成「多出来的帧」，
+    一路狂报 ERROR。**假警报会把真警报淹掉**，比不报还糟。
+    """
+    led = AVLedger(frames_per_block=FPB)
+    feed(led, 3)
+    drain(led)
+    assert led.errors == 0
+
+    led.on_generator_restart("换形象")
+    for i in range(40):                       # 新形象的预热帧
+        led.on_frame(f"warm2.{i}")
+    assert led.errors == 0, "重启后的预热帧被当成错误了"
+    assert led.frames_prewarm == 40
+
+    feed(led, 2)                              # 新形象正常出帧
+    units = drain(led)
+    assert len(units) == 2
+    for u in units:
+        assert all(not str(f).startswith("warm") for f in u.frames), \
+            "旧形象的预热帧混进新形象的块里了"
+    assert led.reconciled
+
+
+def test_restart_drops_in_flight_old_face_frames():
+    """⭐ 换形象时在途的帧是**旧脸**画的，配新音频就是张冠李戴 —— 必须扔。"""
+    led = AVLedger(frames_per_block=FPB)
+    led.on_block_pulled("old")
+    for i in range(FPB - 2):
+        led.on_frame(f"oldface{i}")
+    led.on_generator_restart()
+    assert led.pop_ready() is None
+    feed(led, 1)
+    u = led.pop_ready()
+    assert u is not None
+    assert all("oldface" not in str(f) for f in u.frames), "旧脸的帧串进来了"
+    assert led.reconciled
+
+
+def test_restart_keeps_block_numbers_monotonic():
+    """块号跨重启仍然只增不减 —— 否则日志里换形象前后同号，对不上。"""
+    led = AVLedger(frames_per_block=FPB)
+    feed(led, 3)
+    before = led._next_blk
+    led.on_generator_restart()
+    assert led.on_block_pulled("new") >= before
+
+
 # ── 对账 ──────────────────────────────────────────────────────────
 
 def test_every_frame_is_accounted_for_in_a_messy_run():

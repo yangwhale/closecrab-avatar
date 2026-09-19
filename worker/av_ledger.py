@@ -82,6 +82,13 @@ class AVLedger:
         self._ready: deque[Unit] = deque()     # 帧齐了、等着被取走
         self._utt = 0
         self._next_blk = 0
+        self._awaiting_warmup = True
+        """现在吐出来的帧算不算「预热」。
+
+        ⚠️ 判据**不能**写成 `blocks_pulled == 0` —— 换形象会让上游从头
+        再预热一遍，那时 `blocks_pulled` 早就不是 0 了，于是新一轮的预热帧
+        会被当成「多出来的帧」狂报 ERROR，而它们完全是预期内的。
+        Chris 2026-09-19 提出换图这个 case 时才发现的。"""
 
         # 对账用。**每一项都要能对上**，见 `reconciled`。
         self.frames_seen = 0
@@ -98,6 +105,7 @@ class AVLedger:
 
     def on_block_pulled(self, pcm: Any) -> int:
         """模型要走了一块音频。返回它的块号。"""
+        self._awaiting_warmup = False        # 开始要真音频了，预热结束
         u = Unit(utt=self._utt, blk=self._next_blk, pcm=pcm, want=self.fpb)
         self._next_blk += 1
         self.blocks_pulled += 1
@@ -117,8 +125,8 @@ class AVLedger:
                 return
 
         # 没有块在等帧。两种情况，处理不同：
-        if self.blocks_pulled == 0:
-            #   ① 还一块都没拉过 —— 上游预热阶段用预置音频生成的帧。
+        if self._awaiting_warmup:
+            #   ① 还没拉过块（或刚重启过）—— 上游预热阶段用预置音频生成的帧。
             #      **扔掉**：它不对应我们任何一段声音，混进去就是从第一帧
             #      起就错位。这是预期内的，不算错。
             self.frames_prewarm += 1
@@ -182,6 +190,27 @@ class AVLedger:
             self.blocks_dropped += 1
         self._pending.clear()
         self._ready.clear()
+
+    def on_generator_restart(self, why: str = "换形象") -> None:
+        """上游生成器从头开始了（**换形象是唯一会触发的情形**）。
+
+        > Chris 2026-09-19：「换图片这个事情就把 generate 停了，不能再续上，
+        > 直接从头开始，不要任何 workaround —— 省得上下文污染。」
+
+        对账本来说要做两件事，缺一不可：
+
+        1. **在途的全扔。** 那些帧是旧形象画的，配新音频就是张冠李戴。
+        2. **重新进入预热态。** 上游重启后会再用预置音频跑几轮，
+           那批帧必须当预热扔掉 —— 不重新置位的话它们会被判成
+           「多出来的帧」，一路狂报 ERROR，而那是**预期内**的东西。
+           报错要留给真异常，假警报会把真警报淹掉。
+
+        块号**照旧不重置**（见 `clear`）。
+        """
+        n = len(self._pending) + len(self._ready)
+        self.clear()
+        self._awaiting_warmup = True
+        log.info("生成器重启（%s）：扔掉在途 %d 块，重新进入预热态", why, n)
 
     # ── 对账 ──────────────────────────────────────────────────────
 
