@@ -88,6 +88,7 @@ class AVLedger:
         self.frames_attributed = 0
         self.frames_prewarm = 0        # 还没有任何块时吐出来的，直接扔
         self.frames_dropped = 0        # 背压丢掉的（成块丢）
+        self.frames_rejected = 0       # 无处可归、被拒收的（见 on_frame ②）
         self.blocks_pulled = 0
         self.blocks_dropped = 0
         self.frames_published = 0
@@ -125,6 +126,7 @@ class AVLedger:
         #   ② 已经拉过块，却还多吐 —— 「一块恰好 N 帧」这个假设破了。
         #      **这是整个方案唯一的脆弱点**，必须吵，绝不能默默塞进下一块：
         #      默默塞进去之后，从此每一块都错开一帧，而且再也查不出来。
+        self.frames_rejected += 1
         self.errors += 1
         log.error("多出来的帧：已拉 %d 块、每块应 %d 帧，却又来一帧（累计 %d 次）"
                   "—— 「一块恰好 N 帧」的假设不成立，配对已不可信",
@@ -185,11 +187,19 @@ class AVLedger:
 
     @property
     def reconciled(self) -> bool:
-        """每一帧都有下落吗？"""
+        """每一帧都有下落吗？
+
+        ⚠️ **被拒收的帧也要有位置。** 第一版漏了 `frames_rejected` ——
+        于是只要报过一次「多出来的帧」，对账就永远平不了，而对账正是
+        判断「配对还可不可信」的唯一依据。**一个报过错就再也不会变绿的
+        指标，跟一个永远绿的指标一样没用。**
+        fuzz 第一轮就撞出来了（300 条序列全红）。
+        """
         in_flight = sum(len(u.frames) for u in self._pending) \
             + sum(len(u.frames) for u in self._ready)
-        return self.frames_seen == (self.frames_prewarm + self.frames_dropped
-                                    + self.frames_published + in_flight)
+        return self.frames_seen == (self.frames_prewarm + self.frames_rejected
+                                    + self.frames_dropped + self.frames_published
+                                    + in_flight)
 
     def stats(self) -> dict[str, int | bool]:
         return {
@@ -199,6 +209,7 @@ class AVLedger:
             "frames_seen": self.frames_seen,
             "frames_prewarm": self.frames_prewarm,
             "frames_dropped": self.frames_dropped,
+            "frames_rejected": self.frames_rejected,
             "frames_published": self.frames_published,
             "pending_blocks": len(self._pending),
             "ready_blocks": len(self._ready),
