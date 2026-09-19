@@ -320,7 +320,16 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
     # 真音频从 `t_audio0` 起算，首帧延迟照样准。比猜一个 sleep 秒数稳，
     # 因为它不依赖「多久能就位」这个会随机器和形象变的量。
     LEADIN_S = a.leadin
-    print(f"开始推音频（前面垫 {LEADIN_S:.0f} s 静音，等接收端挂上）")
+    # ⚠️ **默认不垫静音了。** Chris 2026-09-19：「那个前导静音咱也不要了吧？
+    #    没必要，徒增烦恼。上来就正常音频。」
+    #
+    #    它当初是为了绕开「接收端还没挂上、推进去的音频被静默丢掉」。
+    #    代价是那几秒也会生成自己的帧（一张不说话的脸），把「哪些帧属于
+    #    我的音频」这件事搅浑 —— 而那正是今天要查清的东西。
+    #
+    #    不垫的代价：开头零点几秒的话可能丢。但**音视频会一起丢**
+    #    （丢掉的音频压根没进管线，也就没有对应的帧），所以不影响同步判断。
+    print("开始推音频" + (f"（前面垫 {LEADIN_S:.1f} s 静音）" if LEADIN_S else "（不垫静音，上来就是真音频）"))
 
     # 4. 推音频。按实时速率推 —— **一次性灌进去量不出真实延迟**。
     out = DataStreamAudioOutput(agent_room, destination_identity=avatar_identity,
