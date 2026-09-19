@@ -222,11 +222,11 @@ HTML = """<!doctype html>
 
   <div class="card">
     <div class="readout"><span id="val">0</span> ms<br><small id="hint">音频与视频同步</small></div>
-    <input type="range" id="off" min="-800" max="800" step="10" value="0">
-    <div class="ticks"><span>−800（声音提前）</span><span>0</span><span>+800（声音延后）</span></div>
+    <input type="range" id="off" min="-3000" max="3000" step="20" value="0">
+    <div class="ticks"><span>−3000（声音提前）</span><span>0</span><span>+3000（声音延后）</span></div>
     <div class="row">
       <button id="play" class="primary">播放</button>
-      <button data-d="-10">−10</button><button data-d="10">+10</button>
+      <button data-d="-100">−100</button><button data-d="-20">−20</button><button data-d="20">+20</button><button data-d="100">+100</button>
       <button data-f="-1">◀ 帧</button><button data-f="1">帧 ▶</button>
       <button id="zero">归零</button><button id="back">回开头</button>
     </div>
@@ -424,7 +424,7 @@ function renderTable(){
 
 slider.addEventListener('input', ()=>applyOffset(true));
 document.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{
-  slider.value = Math.max(-800, Math.min(800, +slider.value + (+b.dataset.d)));
+  slider.value = Math.max(-3000, Math.min(3000, +slider.value + (+b.dataset.d)));
   applyOffset(true);
 });
 document.querySelectorAll('[data-f]').forEach(b=>b.onclick=()=>step(+b.dataset.f));
