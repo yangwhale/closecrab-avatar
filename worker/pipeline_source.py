@@ -123,6 +123,7 @@ class LiveAvatarPipelineSource:
         **先观察再切换**，而不是接上去直接用：假设要是不成立，
         直接切过去就是把一个静默的错位换成另一个静默的错位。"""
         self._frame_seq = 0
+        self._real_dropped = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
             os.makedirs(self._dump_dir, exist_ok=True)
@@ -343,6 +344,15 @@ class LiveAvatarPipelineSource:
                     self._probe(img)
                     if self._ledger is not None:
                         self._ledger.on_frame(img)     # 观察态：只记账，不改发布
+                        # ⚠️ **观察态必须自己把待发队列抽干。**
+                        #    不抽的话它的队列顶死在上限上，然后按自己的规则
+                        #    往外挤，挤掉的全记成「丢」—— 那是**观察行为自己
+                        #    造出来的数**，不是系统在丢帧。
+                        #    2026-09-19 我就是这么报出一个「生成的 85% 被丢掉」
+                        #    的假发现的。**观察者不能改变被观察的量，包括它
+                        #    自己统计出来的那个量。**
+                        while self._ledger.pop_ready() is not None:
+                            pass
                         self._ledger_report()
                     self._offer(img)
         except Exception:
@@ -361,11 +371,11 @@ class LiveAvatarPipelineSource:
         s = led.stats()
         bad = (not s["reconciled"]) or s["errors"]
         (log.warning if bad else log.info)(
-            "账本[观察态] 块 %d｜帧 见%d 预热%d 拒收%d 丢%d｜在途%d 待发%d"
-            "｜错%d｜对账%s",
+            "账本[观察态] 块 %d｜帧 见%d 预热%d 拒收%d｜在途%d｜错%d｜对账%s"
+            "｜**出帧队列真丢 %d**",
             s["blocks_pulled"], s["frames_seen"], s["frames_prewarm"],
-            s["frames_rejected"], s["frames_dropped"], s["pending_blocks"],
-            s["ready_blocks"], s["errors"], "平" if s["reconciled"] else "**不平**")
+            s["frames_rejected"], s["pending_blocks"], s["errors"],
+            "平" if s["reconciled"] else "**不平**", self._real_dropped)
 
     def _probe(self, img: np.ndarray) -> None:
         """量一下**发出去的像素本身**，别只量「有没有帧」。
@@ -397,18 +407,29 @@ class LiveAvatarPipelineSource:
                  self._frame_seq, mean, float(rgb.std()), black, tag)
 
     def _offer(self, img: np.ndarray) -> None:
-        """塞一帧。满了丢**最旧**的 —— 数字人只有「现在」有意义。"""
+        """塞一帧。满了丢**最旧**的 —— 数字人只有「现在」有意义。
+
+        ⚠️ **这里丢掉的帧才是真的丢了**，而且每丢一帧，音画的对应关系就
+        永久错开一帧（音频那一路不丢）。原来这件事没有任何计数、没有日志 ——
+        一个持续发生、谁也不知道发生了多少次的静默退化。现在数它。
+        """
+        try:
+            self._frames.put_nowait(img)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._frames.get_nowait()
+            self._real_dropped += 1
+            if self._real_dropped in (1, 10) or self._real_dropped % 100 == 0:
+                log.warning("出帧队列满，已丢掉最旧的 %d 帧（每丢一帧，"
+                            "音画对应关系就永久错开 40 ms）", self._real_dropped)
+        except queue.Empty:
+            pass
         try:
             self._frames.put_nowait(img)
         except queue.Full:
-            try:
-                self._frames.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._frames.put_nowait(img)
-            except queue.Full:
-                pass
+            pass
 
     def _generate(self, pipe):
         """调 `generate()`。它是生成器 —— 这正是 blockwise 跟另外两条的区别。
