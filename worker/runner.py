@@ -225,8 +225,7 @@ class Worker:
             #   所以宁可**快失败**：超时就抛出去，`finally` 那段会还槽位并
             #   写清楚卡在哪一步。诊断信息比多等两分钟值钱。
             start_grace = float(job.get("runner_start_grace_s", 30))
-            log.info("会话 %s：挂音频接收 + 发布音视频轨（上限 %.0f s）…",
-                     psid, start_grace)
+            log.info("会话 %s：挂音频接收（上限 %.0f s）…", psid, start_grace)
             try:
                 await asyncio.wait_for(runner.start(), timeout=start_grace)
             except asyncio.TimeoutError:
@@ -235,7 +234,12 @@ class Worker:
                     f"最常见的原因是 agent {job['agent_identity']!r} 进了房但一直不 "
                     f"active —— 它得真发一条轨（生产上 bot 本来就发音轨），"
                     f"光进房不发东西是不够的。") from None
-            log.info("会话 %s：音视频轨已发布，开始收音频", psid)
+            # ⚠️ 这句原来写「音视频轨已发布」—— **是错的**。`AvatarRunner`
+            #    默认 `_lazy_publish=True`，轨要等第一帧推进来才发；这一步
+            #    实测 1 ms 就返回。照那句话读会以为轨已经在了，而服务端
+            #    查出来 `tracks=0`。CloseCrab 那边就是被这句带偏，
+            #    拿「有没有视频轨」当就绪判据，造出一个死锁。
+            log.info("会话 %s：音频接收已挂上（轨等第一帧才发）", psid)
 
             # ⚠️ **不能只听 `disconnected`。** 那个事件只在**自己**被断开时触发，
             #    agent 走了我们照样连着 —— 于是一个人待在空房间里，心跳还
