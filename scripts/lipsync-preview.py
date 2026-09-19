@@ -125,18 +125,34 @@ def save_box_image(vraw: pathlib.Path, w: int, h: int, frame: int, dst: pathlib.
     im.save(dst, quality=88)
 
 
-def build(tag: str, note: str, d: pathlib.Path, leadin: float,
-          out: pathlib.Path, prefix: str) -> dict:
+def measure(tag: str, note: str, d: pathlib.Path, leadin: float,
+            out: pathlib.Path, prefix: str) -> dict:
+    """第一遍：只量，不合。
+
+    分两遍是有原因的：滞后是**整条管线的常数**，可某一条的相关可能很低
+    （画面里头动得多、说话少的段落都会拉低它）。拿一个不可信的补偿值去合，
+    等于让「这一条看着不同步」变成素材本身的问题 —— 而看的人分不出那是
+    模型不行还是我补偿补歪了。所以先全量测完，不可信的借用可信条目的中位数。
+    """
     m = json.loads((d / "meta.json").read_text(encoding="utf-8"))
     w, h, fps = m["width"], m["height"], m["fps"]
     rate, ch = m["sample_rate"], m["channels"]
     vraw, apcm = d / "video.rgba", d / "audio.pcm"
     slug = f"{prefix}-{tag}"
-
     op = mouth_openness(vraw, w, h)
     env = audio_envelope(apcm, rate, ch, len(op))
     lag, corr = measure_lag(op, env, fps)
     save_box_image(vraw, w, h, int(len(op) * 0.6), out / f"{slug}-box.jpg")
+    return dict(tag=tag, note=note, dir=d, leadin=leadin, slug=slug,
+                w=w, h=h, fps=fps, rate=rate, ch=ch, meta=m,
+                lag=lag, corr=corr, weak=corr < MIN_CORR)
+
+
+def build(c: dict, lag: float, out: pathlib.Path) -> dict:
+    """第二遍：按给定的滞后补偿并焊死。"""
+    tag, d, leadin, slug = c["tag"], c["dir"], c["leadin"], c["slug"]
+    w, h, fps, rate, ch, m = c["w"], c["h"], c["fps"], c["rate"], c["ch"], c["meta"]
+    vraw, apcm = d / "video.rgba", d / "audio.pcm"
 
     # 掐头的量必须同时落在整帧和整采样上，否则自己造一个亚帧偏移出来。
     v_skip = int(round((lag + leadin) * fps))
@@ -159,9 +175,7 @@ def build(tag: str, note: str, d: pathlib.Path, leadin: float,
     finally:
         vf.close(); af.close()
 
-    return dict(tag=tag, note=note, slug=slug, lag_ms=round(lag * 1000),
-                corr=round(corr, 2), fps=fps, rate=rate,
-                weak=corr < MIN_CORR,
+    return dict(c, lag_ms=round(lag * 1000), corr=round(c["corr"], 2),
                 video_s=round((m["video_frames"] - v_skip) / fps, 2),
                 audio_s=round((apcm.stat().st_size - a_off) / (rate * ch * 2), 2))
 
@@ -226,19 +240,33 @@ def main() -> int:
     a = ap.parse_args()
 
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    cards = []
+
+    measured = []
     for spec in a.clip:
         parts = [x.strip() for x in spec.split("|")]
         if len(parts) != 4:
             raise SystemExit(f"✗ --clip 要四段「标签|说明|目录|前导秒数」：{spec}")
-        c = build(parts[0], parts[1], pathlib.Path(parts[2]), float(parts[3]),
-                  out, a.prefix)
-        flag = ("　⚠️ 相关偏低，这个补偿值不太可信" if c["weak"] else "")
-        print(f"── {c['tag']}  滞后 {c['lag_ms']} ms  相关 {c['corr']}"
-              + ("  ⚠️ 偏低" if c["weak"] else ""))
+        mm = measure(parts[0], parts[1], pathlib.Path(parts[2]), float(parts[3]),
+                     out, a.prefix)
+        print(f"   量：{mm['tag']}  滞后 {mm['lag']*1000:.0f} ms  相关 {mm['corr']:.2f}"
+              + ("  ⚠️ 偏低，改用可信条目的中位数" if mm["weak"] else ""))
+        measured.append(mm)
+
+    good = [m["lag"] for m in measured if not m["weak"]]
+    if not good:
+        raise SystemExit("✗ 没有一条量得可信 —— 先去 -box.jpg 看取样框是不是框错了")
+    fallback = float(np.median(good))
+
+    cards = []
+    for mm in measured:
+        lag = fallback if mm["weak"] else mm["lag"]
+        c = build(mm, lag, out)
+        flag = (f"　⚠️ 这条相关只有 {c['corr']}，量不准，用的是另外两条的中位数 "
+                f"{fallback*1000:.0f} ms" if mm["weak"] else "")
+        print(f"── {c['tag']}  补偿 {lag*1000:.0f} ms")
         cards.append(CLIP
                      .replace("__TAG__", c["tag"]).replace("__NOTE__", c["note"])
-                     .replace("__LAG__", str(c["lag_ms"])).replace("__CORR__", str(c["corr"]))
+                     .replace("__LAG__", f"{lag*1000:.0f}").replace("__CORR__", str(c["corr"]))
                      .replace("__WEAK__", f'<span class="warn">{flag}</span>')
                      .replace("__VS__", str(c["video_s"])).replace("__AS__", str(c["audio_s"]))
                      .replace("__RATE__", str(c["rate"])).replace("__SLUG__", c["slug"]))
