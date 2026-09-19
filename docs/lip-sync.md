@@ -317,6 +317,10 @@ scripts/mux-av-dump.sh /tmp/cca-dump/<HHMMSS> /tmp/out.mp4
 
 ## 同步应该按序号配对，不是按时间（2026-09-19，待实现）
 
+> **完整设计见 [av-pairing-design.md](av-pairing-design.md)。**
+> 这里只留结论；不变量、失败模式、对账和验收都在那份里。
+
+
 > Chris：「你塞进去 20 ms 音频它吐一个视频帧，那帧是**之前**那次没生成完的，
 > 不是这段音频对应的。靠掐时间不行，不同硬件延迟还不一样。得有个
 > sequence number 告诉你：这个音频帧是第几个、它对应的视频帧什么时候出来。」
