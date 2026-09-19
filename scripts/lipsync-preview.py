@@ -144,6 +144,20 @@ def save_box_image(vraw: pathlib.Path, w: int, h: int, frame: int, dst: pathlib.
     im.save(dst, quality=88)
 
 
+def _output_speech_onset(mp4: pathlib.Path) -> float:
+    """解码成品，量它开头还有多少静音。**这是产物自检，不是过程日志。**"""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(mp4),
+                          "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+                         capture_output=True).stdout
+    a = np.frombuffer(raw, np.int16)
+    if a.size == 0:
+        return 1e9                                   # 一点声音都没有，也算失败
+    hop = 320
+    pk = np.array([np.abs(a[i:i + hop]).max() for i in range(0, len(a) - hop, hop)],
+                  dtype=float)
+    return 0.0 if pk.max() <= 0 else int(np.argmax(pk > pk.max() * 0.08)) * hop / 16000
+
+
 def measure(tag: str, note: str, d: pathlib.Path, leadin: float,
             out: pathlib.Path, prefix: str) -> dict:
     """第一遍：只量，不合。
@@ -183,21 +197,42 @@ def build(c: dict, lag: float, out: pathlib.Path) -> dict:
     a_skip = max(0, int(round(head * rate)))
     v_off, a_off = v_skip * w * h * 4, a_skip * ch * 2
 
+    # ⚠️ **音频掐头必须落盘成临时文件，不能把 seek 过的 fd 经 `/dev/fd/N`
+    #    交给 ffmpeg。** 在 Linux 上打开 `/dev/fd/N`（普通文件）等于**重新
+    #    打开这个文件**，偏移量归零 —— seek 那一下被悄悄丢掉，掐头完全失效。
+    #
+    #    视频走 stdin 是真管道，偏移保留，所以只有音频这一路坏掉 ——
+    #    产物是「画面切了、声音没切」，看起来正好像「声音晚了两秒」。
+    #
+    #    2026-09-19 这个 bug 造成了一次**级联误判**：Chris 照着坏产物报
+    #    「嘴快了半秒到一秒」，我拿这个读数去校准补偿值，把它从 1800 调到
+    #    1050 —— 用一个坏掉的观测去调参，越调越错。
+    tmp_a = out / f".{slug}.pcm"
+    with open(apcm, "rb") as src, open(tmp_a, "wb") as dst:
+        src.seek(a_off)
+        while chunk := src.read(1 << 20):
+            dst.write(chunk)
     vf = open(vraw, "rb"); vf.seek(v_off)
-    af = open(apcm, "rb"); af.seek(a_off)
     try:
         subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
              "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", str(fps),
              "-i", "pipe:0",
-             "-f", "s16le", "-ar", str(rate), "-ac", str(ch), "-i", f"/dev/fd/{af.fileno()}",
+             "-f", "s16le", "-ar", str(rate), "-ac", str(ch), "-i", str(tmp_a),
              "-map", "0:v", "-map", "1:a", "-shortest",
              "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
              str(out / f"{slug}.mp4")],
-            stdin=vf, check=True, pass_fds=(af.fileno(),))
+            stdin=vf, check=True)
     finally:
-        vf.close(); af.close()
+        vf.close(); tmp_a.unlink(missing_ok=True)
+
+    # ⭐ **验产物，不验意图。** 上面那个 bug 的全部代价，就是因为没人回头
+    #    量一眼产出来的文件 —— 代码看着对、日志也没报错、产物是错的。
+    out_head = _output_speech_onset(out / f"{slug}.mp4")
+    if out_head > 0.25:
+        raise SystemExit(f"✗ {slug}: 成品开头还有 {out_head*1000:.0f} ms 静音，"
+                         f"掐头没生效 —— 别再发出去了")
 
     return dict(c, lag_ms=round(lag * 1000), corr=round(c["corr"], 2),
                 video_s=round((m["video_frames"] - v_skip) / fps, 2),
