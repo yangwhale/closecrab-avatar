@@ -67,7 +67,6 @@ import threading
 import numpy as np
 
 from .audio_feat import StreamingAudioFeat
-from .av_ledger import AVLedger
 from .audio_stream import BlockGeometry, PcmInbox
 
 log = logging.getLogger("closecrab.avatar.pipeline")
@@ -114,21 +113,8 @@ class LiveAvatarPipelineSource:
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
         self._feat: StreamingAudioFeat | None = None
-        self._ledger: AVLedger | None = None
-        """音画配对账本。**当前是「只观察不改行为」**。
-
-        整个配对方案压在一个假设上：**一次 `pull_block()` 恰好产
-        `infer_frames` 帧**。这条我在外面验不了 —— 上游吐的是裸张量，
-        既没有块号也没有边界。所以先让账本在真实负载下跟着数，
-        它报不报错就是这个假设成不成立的答案。
-
-        **先观察再切换**，而不是接上去直接用：假设要是不成立，
-        直接切过去就是把一个静默的错位换成另一个静默的错位。"""
         self._frame_seq = 0
         self._real_dropped = 0
-        self._pair_root = (os.environ.get("CCA_PAIRED_DUMP") or "").strip() or None
-        self._pair_a = self._pair_v = None
-        self._pair_n = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
             os.makedirs(self._dump_dir, exist_ok=True)
@@ -188,8 +174,6 @@ class LiveAvatarPipelineSource:
                 self._frames.get_nowait(); n += 1
             except queue.Empty:
                 break
-        if self._ledger is not None:
-            self._ledger.on_pipeline_drained()
         if n:
             log.info("抽干出帧队列（%s）：扔掉残留 %d 帧，配对基准归零", why, n)
         return n
@@ -340,25 +324,8 @@ class LiveAvatarPipelineSource:
         # ⚠️ 临时计数：查「一块音频是不是被拉了两次」。
         #    实测配对落盘里音频正好是视频的 2 倍 —— 要么两条路都在拉，
         #    要么有一条在白拉（拉走的那块直接丢了）。**后者是重大 bug**。
-        self._pull_via = {"cb": 0, "feat": 0}
 
-        def _mk_pull(who):
-            def _pull():
-                self._pull_via[who] += 1
-                n = sum(self._pull_via.values())
-                if n in (1, 2, 3, 4, 10) or n % 100 == 0:
-                    log.warning("拉块来源统计：get_audio_callback=%d  feat=%d",
-                                self._pull_via["cb"], self._pull_via["feat"])
-                chunk = self.inbox.pull_block()
-                if self._ledger is not None and chunk is not None:
-                    self._ledger.on_block_pulled(chunk)
-                return chunk
-            return _pull
-
-        self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
-                                max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8),
-                                lead_blocks=_int_env("CCA_LEAD_BLOCKS", 0))
-        pipe.get_audio_callback = _mk_pull("cb")
+        pipe.get_audio_callback = self.inbox.pull_block
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。
         #    上游 `_streaming_encode_next_audio_block_or_random` 把每一块
@@ -376,7 +343,7 @@ class LiveAvatarPipelineSource:
             return emb[..., :block_frames].contiguous()
 
         self._feat = StreamingAudioFeat(
-            pipe.audio_encoder, pull=_mk_pull("feat"),
+            pipe.audio_encoder, pull=self.inbox.pull_block,
             block_samples=self.geometry.block_samples, fps=self.geometry.fps,
             device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
         pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
@@ -389,106 +356,10 @@ class LiveAvatarPipelineSource:
                     continue             # DiT rank 只 yield None，不出帧
                 for img in self._to_rgba(item):
                     self._probe(img)
-                    if self._ledger is not None:
-                        self._ledger.on_frame(img)     # 观察态：只记账，不改发布
-                        # ⚠️ **观察态必须自己把待发队列抽干。**
-                        #    不抽的话它的队列顶死在上限上，然后按自己的规则
-                        #    往外挤，挤掉的全记成「丢」—— 那是**观察行为自己
-                        #    造出来的数**，不是系统在丢帧。
-                        #    2026-09-19 我就是这么报出一个「生成的 85% 被丢掉」
-                        #    的假发现的。**观察者不能改变被观察的量，包括它
-                        #    自己统计出来的那个量。**
-                        while (unit := self._ledger.pop_ready()) is not None:
-                            self._dump_pair(unit)
-                        self._ledger_report()
                     self._offer(img)
         except Exception:
             # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
             log.exception("生成中断，这一路退化成只出声")
-
-    def _dump_pair(self, unit) -> None:      # noqa: ANN001
-        """把**配好对的一组**落盘：这一块音频，紧跟它生成的那几帧。
-
-        ⭐ 这么出来的片子，同步是**构造出来的**，不是量出来的 ——
-        写进文件的每一帧，就是写在它前面那段音频生成的。没有补偿、
-        没有偏移参数、没有「我觉得差 1750 毫秒」。
-
-        > Chris 2026-09-19：「现在是同步问题。你先把一个视频给我弄对了再说。」
-
-        所以这条路不等发布侧改完：账本在观察态就已经知道谁配谁，
-        直接把它知道的东西写出来即可。**它同时也是发布侧的验收基准** ——
-        发布侧改完之后出来的片子，应该跟这个一模一样。
-
-        音频是模型吃进去的那一份（16 kHz 单声道）。判口型足够，
-        而且它跟帧的对应关系是**定义上的**，不经过任何重采样或转发。
-
-        开关：`CCA_PAIRED_DUMP=<目录>`。默认不开。
-        """
-        # ⚠️ **五个 rank 都会跑到这儿，但只有一个真出帧。**
-        #    第一版在创建账本时就把文件打开了 —— 于是五个 rank 各开一次
-        #    同一个路径（目录名精确到秒，必然撞），后开的把先开的截断，
-        #    写出来的东西互相打架：音频 206 块、视频却只有 103 块的量。
-        #    改成**第一帧真要写的时候才开**：不出帧的 rank 永远走不到这里。
-        if self._pair_root is None:
-            return
-        if self._pair_a is None:
-            if not self._open_pair_files():
-                return
-        try:
-            # ⚠️ **`pull_block()` 返回的是 float32 [-1,1]**（它的 docstring 写着，
-            #    wav2vec 的 processor 要这个量纲）。直接 tobytes() 写出去、
-            #    再按 s16le 读，每块就变成两倍长 —— 合出来音频正好是视频的 2 倍。
-            #    我在这上面绕了两圈：先怀疑「一半音频被吃掉」（被计数证伪），
-            #    再怀疑多 rank 抢文件（确有其事，但不是这个 2 倍的原因）。
-            #    **两个真 bug 叠在同一个症状上，修掉第一个时症状没变，
-            #    很容易以为第一个没修对。**
-            pcm = np.asarray(unit.pcm, dtype=np.float32)
-            self._pair_a.write((np.clip(pcm, -1.0, 1.0) * 32767.0)
-                               .astype(np.int16).tobytes())
-            for img in unit.frames:
-                self._pair_v.write(img.tobytes())
-            self._pair_n += 1
-        except Exception:                            # noqa: BLE001
-            log.warning("配对落盘失败，本场停止", exc_info=True)
-            self._pair_root = None
-
-    def _open_pair_files(self) -> bool:
-        """真要写第一帧了才开文件。目录名带 PID，**多个 rank 也不会撞**。"""
-        import time as _t
-        try:
-            d = pathlib.Path(self._pair_root) / f"{_t.strftime('%H%M%S')}-{os.getpid()}"
-            d.mkdir(parents=True, exist_ok=True)
-            self._pair_a = open(d / "paired.pcm", "wb")
-            self._pair_v = open(d / "paired.rgba", "wb")
-            (d / "meta.json").write_text(json.dumps({
-                "width": self.size[0], "height": self.size[1],
-                "fps": self.geometry.fps, "sample_rate": self.geometry.sample_rate,
-                "channels": 1, "frames_per_block": self.geometry.frames_per_block,
-            }, ensure_ascii=False, indent=1), encoding="utf-8")
-            log.info("⭐ 配对落盘 → %s（同步是构造出来的，不是量出来的）", d)
-            return True
-        except Exception:                            # noqa: BLE001
-            log.warning("配对落盘开不起来", exc_info=True)
-            self._pair_root = None
-            return False
-
-    def _ledger_report(self) -> None:
-        """定期把账本状态吼一声。**观察态不出声就等于没接。**
-
-        报的是「这一块的帧对上没有」，**不是「发了几秒」** —— 后者正是
-        现有那个一路绿灯的监控在数的东西，它永远是绿的（见 docs/lip-sync.md）。
-        """
-        led = self._ledger
-        if led is None or led.frames_seen % 250:
-            return
-        s = led.stats()
-        bad = (not s["reconciled"]) or s["errors"]
-        (log.warning if bad else log.info)(
-            "账本[观察态] 块 %d｜帧 见%d 预热%d 拒收%d｜在途%d｜错%d｜对账%s"
-            "｜**出帧队列真丢 %d**",
-            s["blocks_pulled"], s["frames_seen"], s["frames_prewarm"],
-            s["frames_rejected"], s["pending_blocks"], s["errors"],
-            "平" if s["reconciled"] else "**不平**", self._real_dropped)
 
     def _probe(self, img: np.ndarray) -> None:
         """量一下**发出去的像素本身**，别只量「有没有帧」。
