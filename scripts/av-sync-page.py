@@ -178,8 +178,9 @@ HTML = """<!doctype html>
 
   <div class="card">
     <video id="v" playsinline muted preload="auto"></video>
-    <audio id="a" preload="auto"></audio>
+    <audio id="a" preload="auto" style="display:none"></audio>
     <canvas id="wave" height="80"></canvas>
+    <div class="note" id="astate">声音：还没开始</div>
   </div>
 
   <div class="card">
@@ -224,101 +225,70 @@ const hint=document.getElementById('hint'), playBtn=document.getElementById('pla
 const cv=document.getElementById('wave'), ctx=cv.getContext('2d');
 let cur = 0;
 
-const store = {
-  get(tag){ const x = localStorage.getItem(KEY+':'+tag); return x===null?null:+x; },
-  set(tag,v){ localStorage.setItem(KEY+':'+tag, String(v)); },
-};
+/* ── 声音走 WebAudio，不走 <audio> 元素 ────────────────────────────
+   两个理由，第二个是被 Chris 2026-09-19「你忘了放音轨了吧？没有声」
+   逼出来的：
 
-function clip(){ return CLIPS[cur]; }
-function offset(){ const o = store.get(clip().tag); return o===null?0:o; }
+   1. **`<audio>` 元素在各家 webview 里太不可靠。** 飞书/微信内置浏览器、
+      iOS 上的静音开关、第二个媒体元素拿不到播放许可 —— 任何一条中招都
+      表现为「视频在动、没有声音」，而我上一版把 `a.play()` 的失败
+      `.catch(()=>{})` 吞掉了，**连报都不报**。
+   2. 拖偏移要的是**采样级**定位，`audio.currentTime = x` 是粗的。
 
-function renderChips(){
-  document.getElementById('chips').innerHTML = CLIPS.map((c,i)=>{
-    const o = store.get(c.tag);
-    const mark = o===null ? '' : ' <span class="done">'+(o>0?'+':'')+o+'</span>';
-    return '<button class="chip'+(i===cur?' on':'')+'" data-i="'+i+'">'+c.tag+mark+'</button>';
-  }).join('');
-  document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>select(+b.dataset.i));
-}
+   解不开就退回 <audio>，而且**把失败写在页面上**，不再静默。
+------------------------------------------------------------------ */
+let actx=null, abuf=null, asrc=null, aT0=0, vT0=0, useEl=false;
+const astate = document.getElementById('astate');
+function say(t, bad){ astate.textContent = '声音：'+t; astate.style.color = bad ? 'var(--warn)' : 'var(--mute)'; }
 
-function select(i){
-  cur = i; const c = clip();
-  v.pause(); a.pause(); playBtn.textContent='播放';
-  v.src = c.slug+'.mp4'; a.src = c.slug+'.m4a';
-  document.getElementById('note').textContent =
-    c.note+' ｜ '+c.sample_rate+' Hz ｜ 视频 '+c.video_seconds.toFixed(2)+
-    ' s ｜ 音频 '+c.audio_seconds.toFixed(2)+' s ｜ '+c.width+'×'+c.height+' @ '+c.fps+' fps';
-  document.getElementById('fms').textContent = (1000/c.fps).toFixed(0);
-  slider.value = offset(); applyOffset(false);
-  renderChips(); renderTable();
-}
-
-function applyOffset(save){
-  const o = +slider.value;
-  val.textContent = (o>0?'+':'')+o;
-  hint.textContent = o===0 ? '音频与视频同步'
-    : o>0 ? '声音比画面晚 '+o+' ms' : '声音比画面早 '+(-o)+' ms';
-  if (save){ store.set(clip().tag, o); renderChips(); renderTable(); }
-  syncAudio(true);
-}
-
-// ⚠️ 视频是时钟，音频跟着它对。反过来在 seek 时会打架 —— video 的 seek
-//    是关键帧对齐的，audio 不是，互相追会来回抖。
-function targetAudioTime(){ return v.currentTime - offset()/1000; }
-function syncAudio(force){
-  const t = targetAudioTime();
-  if (t<0 || t>(a.duration||1e9)){ if(!a.paused) a.pause(); return; }
-  if (force || Math.abs(a.currentTime-t) > 0.035) a.currentTime = t;
-  if (!v.paused && a.paused) a.play().catch(()=>{});
-}
-
-slider.addEventListener('input', ()=>applyOffset(true));
-document.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{
-  slider.value = Math.max(-800, Math.min(800, +slider.value + (+b.dataset.d)));
-  applyOffset(true);
-});
-document.getElementById('zero').onclick=()=>{ slider.value=0; applyOffset(true); };
-document.getElementById('back').onclick=()=>{ v.currentTime=0; syncAudio(true); };
-
-function toggle(){
-  if (v.paused){ v.play(); syncAudio(true); a.play().catch(()=>{}); playBtn.textContent='暂停'; }
-  else { v.pause(); a.pause(); playBtn.textContent='播放'; }
-}
-playBtn.onclick=toggle;
-v.addEventListener('pause', ()=>{ a.pause(); playBtn.textContent='播放'; });
-
-function step(n){
-  v.pause(); a.pause(); playBtn.textContent='播放';
-  v.currentTime = Math.max(0, v.currentTime + n*(1/clip().fps));
-  setTimeout(()=>syncAudio(true), 30);
-}
-document.querySelectorAll('[data-f]').forEach(b=>b.onclick=()=>step(+b.dataset.f));
-addEventListener('keydown', e=>{
-  if(e.key==='ArrowLeft'){ step(-1); e.preventDefault(); }
-  if(e.key==='ArrowRight'){ step(1); e.preventDefault(); }
-  if(e.key===' '){ toggle(); e.preventDefault(); }
-});
-
-(function loop(){ if(!v.paused) syncAudio(false); requestAnimationFrame(loop); })();
-
-function drawWave(){
-  const c = clip(), w = cv.clientWidth, h = cv.height, dpr = devicePixelRatio||1;
-  cv.width = w*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.clearRect(0,0,w,h);
-  ctx.fillStyle = '#dbe4f3';
-  const n = c.env.length;
-  for (let i=0;i<n;i++){
-    const x = i/n*w, bh = Math.max(1, c.env[i]*(h-22));
-    ctx.fillRect(x, h-18-bh, Math.max(1, w/n), bh);
+async function ensureAudio(){
+  const c = clip();
+  if (useEl) return;
+  try {
+    if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+    if (actx.state !== 'running') await actx.resume();
+    if (abuf && abuf._slug === c.slug) return;
+    say('正在解码…');
+    const buf = await (await fetch(c.slug+'.m4a')).arrayBuffer();
+    abuf = await actx.decodeAudioData(buf);
+    abuf._slug = c.slug;
+    say('已就绪（WebAudio）');
+  } catch (e) {
+    useEl = true;                       // 退回 <audio>，但**说出来**
+    say('WebAudio 起不来（'+e.message+'），已退回 <audio> 元素', true);
   }
-  const x = Math.max(0, Math.min(1, targetAudioTime()/(c.audio_seconds||1)))*w;
-  ctx.fillStyle = '#b3261e'; ctx.fillRect(x-1, 0, 2, h-14);
-  ctx.fillStyle = '#5f6368'; ctx.font='11px system-ui';
-  ctx.fillText('音频包络（红线 = 此刻听到的位置）', 4, h-3);
-  requestAnimationFrame(drawWave);
 }
-drawWave();
 
+function stopSrc(){ if (asrc){ try{asrc.stop();}catch(_){} asrc=null; } }
+
+function startSrc(){
+  if (useEl || !abuf) return;
+  stopSrc();
+  const at = targetAudioTime();
+  if (at < 0 || at >= abuf.duration) return;   // 偏移把音频推到片外了
+  asrc = actx.createBufferSource();
+  asrc.buffer = abuf; asrc.connect(actx.destination);
+  asrc.start(0, at);
+  aT0 = actx.currentTime - at; vT0 = v.currentTime - at;
+  say('播放中（WebAudio）');
+}
+
+function targetAudioTime(){ return v.currentTime - offset()/1000; }
+
+// 兜底那条路才需要逐帧对表；WebAudio 自己走自己的时钟，只做漂移纠正。
+function syncAudio(force){
+  if (useEl){
+    const t = targetAudioTime();
+    if (t<0 || t>(a.duration||1e9)){ if(!a.paused) a.pause(); return; }
+    if (force || Math.abs(a.currentTime-t) > 0.035) a.currentTime = t;
+    if (!v.paused && a.paused) a.play().then(()=>say('播放中（<audio>）'))
+                                       .catch(e=>say('播不出来：'+e.message, true));
+    return;
+  }
+  if (!asrc || v.paused) return;
+  const drift = (actx.currentTime - aT0) - (v.currentTime - vT0);
+  if (Math.abs(drift) > 0.05) startSrc();     // 漂了就重新对一次
+}
 function renderTable(){
   const head = '<tr><th>样本</th><th>变量</th><th class="num">采样率</th>'
              + '<th class="num">时长 s</th><th class="num">你量到的偏移</th></tr>';
