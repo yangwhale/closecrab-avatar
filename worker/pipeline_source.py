@@ -354,7 +354,16 @@ class LiveAvatarPipelineSource:
         #   upstream       上游原版逐块编码 —— 对照用，0.49
         # 留着后两个不是为了将来可能用，是因为**这三条的优劣只能实测**，
         # 没有开关就只能靠读代码猜，而这件事已经猜错过两轮。
-        mode = (os.environ.get("CCA_AUDIO_FEAT") or "utterance").strip().lower()
+        # ⚠️ **默认仍是 sliding，不是 utterance。** utterance 那条口型对得多，
+        #    但**还没完工**：没人说话时上游照样要块（不给就五卡死锁），那些
+        #    静音块生成的画面目前会照发 —— 实测 12 s 音频出 57.8 s 视频，
+        #    音频跟着空转的画面跑，等于又不同步。
+        #
+        #    缺的那一环是「这一帧是哪一块生成的」，好把静音块的帧扔掉。
+        #    那正是今天上午删掉的 av_ledger 干的事 —— 删的时候以为抽干方案
+        #    让它没用了，其实只是那会儿还没遇到「必须空转」这个约束。
+        #    **要装回来，但今晚不装。**
+        mode = (os.environ.get("CCA_AUDIO_FEAT") or "sliding").strip().lower()
         if mode == "upstream":
             log.warning("⚠️ CCA_AUDIO_FEAT=upstream：走上游原版逐块编码。对照用，不是常态。")
             self._feat = None
