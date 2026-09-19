@@ -47,6 +47,28 @@
 三个端点本来就全在我们这儿（要音频的回调、帧队列、发布循环），
 所以这层收口不需要上游配合，也不需要调用方配合。
 
+## ⭐ 这个接口不用我们发明 —— 官方契约本来就是这个形状
+
+`livekit.agents.voice.avatar._types.VideoGenerator`，**供应商要实现的那个抽象类**：
+
+```python
+class VideoGenerator(ABC):
+    async def push_audio(frame: rtc.AudioFrame | AudioSegmentEnd) -> None
+    def clear_buffer(self) -> None
+    def __aiter__() -> AsyncIterator[rtc.VideoFrame | rtc.AudioFrame | AudioSegmentEnd]
+```
+
+看第三行的返回类型：**迭代出来的既有 `VideoFrame` 也有 `AudioFrame`。**
+官方要求供应商**把音频自己重新吐出来**，跟它生成的画面交错在同一条流里。
+
+⇒ **配对靠的是「这条流里的先后顺序」，官方协议里没有序号。**
+⇒ 我们的 `LiveGenerator` 本来就实现的是这个接口。**所以这不是要新造一套 API，
+   是把已有契约实现对** —— 现在交错的顺序是按「已发出几秒」决定的，
+   该按「这几帧是哪块音频生成的」决定。
+
+内部仍然需要账本（下面那节），但它**只用于决定交错顺序**，不外露。
+这跟 Chris 要的「我扔进去就不管，你把配好对的还我」是同一件事。
+
 ## 不变量（内部）
 
 **每一帧和每一块音频，内部都带同一个身份：`(utt, blk, i)`**
