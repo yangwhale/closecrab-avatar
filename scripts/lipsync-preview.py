@@ -56,35 +56,12 @@ import sys
 
 import numpy as np
 
-# 嘴的位置（占画幅比例）。这套数是 384×704 竖版头肩像上量准的；换形象要重调，
-# **而且必须看一眼 `-box.jpg` 再采信数字**。
-MOUTH = dict(y0=0.38, y1=0.51, x0=0.38, x1=0.66)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from worker.mouth_metric import MOUTH, draw_box, mouth_openness  # noqa: E402
+
 LAG_SEARCH_S = (-0.5, 3.5)          # 滞后搜索范围
 MIN_CORR = 0.18                     # 低于这个就别声称量准了
-
-
-def mouth_openness(vraw: pathlib.Path, w: int, h: int) -> np.ndarray:
-    """逐帧的「张嘴程度」。
-
-    取嘴部方框里的**暗像素占比** —— 口腔内部比嘴唇和皮肤暗得多，
-    张嘴这个动作在灰度上最稳的表现就是暗区变大。比帧间差分好：
-    差分会把眨眼、头微动一起算进来，而那些跟说话没关系。
-    """
-    y0, y1 = int(h * MOUTH["y0"]), int(h * MOUTH["y1"])
-    x0, x1 = int(w * MOUTH["x0"]), int(w * MOUTH["x1"])
-    fsz, rowsz = w * h * 4, w * 4
-    out = []
-    with open(vraw, "rb") as f:
-        n = vraw.stat().st_size // fsz
-        for i in range(n):
-            f.seek(i * fsz + y0 * rowsz)          # 只读嘴那几行，别整帧搬
-            band = np.frombuffer(f.read((y1 - y0) * rowsz), np.uint8)
-            band = band.reshape(y1 - y0, w, 4)[:, x0:x1, :3]
-            gray = band.mean(axis=2)
-            out.append(gray)
-    g = np.stack(out)
-    thr = np.percentile(g, 12)                    # 全片统一阈值，别逐帧自适应
-    return (g < thr).mean(axis=(1, 2))
 
 
 def audio_envelope(apcm: pathlib.Path, rate: int, ch: int, n: int) -> np.ndarray:
@@ -175,7 +152,7 @@ def measure(tag: str, note: str, d: pathlib.Path, leadin: float,
     op = mouth_openness(vraw, w, h)
     env = audio_envelope(apcm, rate, ch, len(op))
     lag, corr = measure_lag(op, env, fps)
-    save_box_image(vraw, w, h, int(len(op) * 0.6), out / f"{slug}-box.jpg")
+    draw_box(vraw, w, h, int(len(op) * 0.6), out / f"{slug}-box.jpg")
     return dict(tag=tag, note=note, dir=d, leadin=leadin, slug=slug,
                 w=w, h=h, fps=fps, rate=rate, ch=ch, meta=m,
                 lag=lag, corr=corr, weak=corr < MIN_CORR)
