@@ -308,11 +308,23 @@ class LiveAvatarPipelineSource:
         # ⭐ 包一层再挂上去：**这是唯一能知道「第几块被吃掉了」的地方**。
         #    两个使用点（`get_audio_callback` 和 `StreamingAudioFeat` 的 pull）
         #    都走它，漏掉任何一个账本就从此错位。
-        def _pull_and_register():
-            chunk = self.inbox.pull_block()
-            if self._ledger is not None and chunk is not None:
-                self._ledger.on_block_pulled(chunk)
-            return chunk
+        # ⚠️ 临时计数：查「一块音频是不是被拉了两次」。
+        #    实测配对落盘里音频正好是视频的 2 倍 —— 要么两条路都在拉，
+        #    要么有一条在白拉（拉走的那块直接丢了）。**后者是重大 bug**。
+        self._pull_via = {"cb": 0, "feat": 0}
+
+        def _mk_pull(who):
+            def _pull():
+                self._pull_via[who] += 1
+                n = sum(self._pull_via.values())
+                if n in (1, 2, 3, 4, 10) or n % 100 == 0:
+                    log.warning("拉块来源统计：get_audio_callback=%d  feat=%d",
+                                self._pull_via["cb"], self._pull_via["feat"])
+                chunk = self.inbox.pull_block()
+                if self._ledger is not None and chunk is not None:
+                    self._ledger.on_block_pulled(chunk)
+                return chunk
+            return _pull
 
         self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
                                 max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8))
@@ -330,7 +342,7 @@ class LiveAvatarPipelineSource:
                 "channels": 1, "frames_per_block": self.geometry.frames_per_block,
             }, ensure_ascii=False, indent=1), encoding="utf-8")
             log.info("⭐ 配对落盘开着 → %s（同步是构造出来的，不是量出来的）", d)
-        pipe.get_audio_callback = _pull_and_register
+        pipe.get_audio_callback = _mk_pull("cb")
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。
         #    上游 `_streaming_encode_next_audio_block_or_random` 把每一块
@@ -348,7 +360,7 @@ class LiveAvatarPipelineSource:
             return emb[..., :block_frames].contiguous()
 
         self._feat = StreamingAudioFeat(
-            pipe.audio_encoder, pull=_pull_and_register,
+            pipe.audio_encoder, pull=_mk_pull("feat"),
             block_samples=self.geometry.block_samples, fps=self.geometry.fps,
             device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
         pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
