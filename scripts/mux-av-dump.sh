@@ -30,7 +30,13 @@ v=os.path.getsize('$DIR/video.rgba'); a=os.path.getsize('$DIR/audio.pcm')
 vs=v/(m['width']*m['height']*4)/m['fps']
 as_=a/(m['sample_rate']*m['channels']*2)
 print(f'视频 {vs:.2f} 秒 / 音频 {as_:.2f} 秒 —— 差 {abs(vs-as_)*1000:.0f} ms')
-print('⚠️ 两者相差超过一帧，说明服务端这一侧就没配平' if abs(vs-as_) > 1/m['fps'] else '✅ 时长对得上')
+# ⚠️ 门槛是**一整块**不是一帧。段尾不足一块的那截由 mark_segment_end()
+# 补零放行，它照样产一整块的帧 —— 于是视频总是比音频长 0~一块，
+# 这是确定性的，不是漂移。门槛卡在一帧上会让每一场都报警，
+# 而天天报的警等于没有警。
+tol = m.get('frames_per_block', 12) / m['fps']
+print(f'⚠️ 差了 {abs(vs-as_)*1000:.0f} ms，超过一块（{tol*1000:.0f} ms）—— 这是真的没配平'
+      if abs(vs-as_) > tol + 1e-6 else '✅ 时长对得上（差值在段尾补零那一块之内）')
 "
 
 # ⚠️ 视频用 `-r` 而不是 `-framerate`：裸流没有时间信息，全靠这个数定节奏。

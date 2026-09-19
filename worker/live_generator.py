@@ -205,7 +205,8 @@ class LiveAvatarGenerator(VideoGenerator):
         """
 
         # 排障用的离线录制。默认不开，开关见 `av_dump.AVDump`。
-        self._dump = AVDump(self._geom.fps, source.size)
+        self._dump = AVDump(self._geom.fps, source.size,
+                            self._geom.frames_per_block)
 
         self._rolling = False          # 攒够了没有
         self._video_out_s = 0.0        # 已吐出去的视频时长

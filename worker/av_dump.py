@@ -47,11 +47,13 @@ class AVDump:
     这是个排障工具：它坏了顶多是没录上，而它把会话搞挂就是本末倒置。
     """
 
-    def __init__(self, geom_fps: int, size: tuple[int, int]) -> None:
+    def __init__(self, geom_fps: int, size: tuple[int, int],
+                 frames_per_block: int = 12) -> None:
         self.on = False
         self._dir: pathlib.Path | None = None
         self._v = self._a = None
         self._fps = geom_fps
+        self._fpb = frames_per_block
         self._size = size
         self._rate = 0
         self._ch = 1
@@ -112,6 +114,9 @@ class AVDump:
                 "sample_rate": self._rate or 48000, "channels": self._ch,
                 "video_frames": self._nv, "audio_frames": self._na,
                 "video_seconds": round(self._nv / self._fps, 2),
+                # 合片脚本拿它算容差：段尾补零那一块让视频总比音频长
+                # 0~一块，是确定性的，不该报警。写死 12 会在换几何时悄悄失准。
+                "frames_per_block": self._fpb,
             }
             (self._dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
