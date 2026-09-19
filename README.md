@@ -73,6 +73,7 @@ sudo systemctl enable --now closecrab-avatar-worker@0     # 一卡一个进程
 | 上线之后怎么看、怎么修 | [operations.md](docs/operations.md) |
 | **给数字人挑一张什么样的照片** | [reference-image.md](docs/reference-image.md) |
 | **口型对不上 / 不够顺** | [lip-sync.md](docs/lip-sync.md) |
+| ⛔ **为什么口型始终做不对 / 要不要继续搞实时** | [streaming-audio-dead-end.md](docs/streaming-audio-dead-end.md) —— **动手前先读这篇** |
 | **音画怎么对齐的** | [av-pairing-design.md](docs/av-pairing-design.md) |
 | 换形象、两张脸混在一起 | [face-swap.md](docs/face-swap.md) |
 | 为什么是这个架构 | [architecture.md](docs/architecture.md) |

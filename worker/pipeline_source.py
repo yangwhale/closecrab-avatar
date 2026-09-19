@@ -369,7 +369,11 @@ class LiveAvatarPipelineSource:
         #   upstream       上游原版逐块编码 —— 对照用，0.49
         # 留着后两个不是为了将来可能用，是因为**这三条的优劣只能实测**，
         # 没有开关就只能靠读代码猜，而这件事已经猜错过两轮。
-        mode = (os.environ.get("CCA_AUDIO_FEAT") or "utterance").strip().lower()
+        # ⚠️ **默认停在 sliding。** 三条都试过，口型都不行（见
+        #    docs/streaming-audio-dead-end.md）。既然都不行，就停在跑得
+        #    最久、行为最熟的那条上，别让一个同样不行但更新的实现去承担
+        #    「说不清为什么」的风险。
+        mode = (os.environ.get("CCA_AUDIO_FEAT") or "sliding").strip().lower()
         if mode == "upstream":
             log.warning("⚠️ CCA_AUDIO_FEAT=upstream：走上游原版逐块编码。对照用，不是常态。")
             self._feat = None
