@@ -65,9 +65,18 @@ import threading
 import numpy as np
 
 from .audio_feat import StreamingAudioFeat
+from .av_ledger import AVLedger
 from .audio_stream import BlockGeometry, PcmInbox
 
 log = logging.getLogger("closecrab.avatar.pipeline")
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        log.warning("%s 不是整数，用默认 %d", name, default)
+        return default
 
 # 出帧队列上限。会话没接上的时候帧会堆在这儿 —— 堆满就丢**最旧**的，
 # 因为数字人只有「现在」有意义，补播两秒前的嘴型比丢帧更糟。
@@ -103,6 +112,16 @@ class LiveAvatarPipelineSource:
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
         self._feat: StreamingAudioFeat | None = None
+        self._ledger: AVLedger | None = None
+        """音画配对账本。**当前是「只观察不改行为」**。
+
+        整个配对方案压在一个假设上：**一次 `pull_block()` 恰好产
+        `infer_frames` 帧**。这条我在外面验不了 —— 上游吐的是裸张量，
+        既没有块号也没有边界。所以先让账本在真实负载下跟着数，
+        它报不报错就是这个假设成不成立的答案。
+
+        **先观察再切换**，而不是接上去直接用：假设要是不成立，
+        直接切过去就是把一个静默的错位换成另一个静默的错位。"""
         self._frame_seq = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
@@ -280,7 +299,18 @@ class LiveAvatarPipelineSource:
         pipe = self._pipe
         # ⭐ 上游缺的就是这一行。只有 VAE rank 会调它（见文件头）；
         #    DiT rank 装了也不会被调，装上无害、少一个分支。
-        pipe.get_audio_callback = self.inbox.pull_block
+        # ⭐ 包一层再挂上去：**这是唯一能知道「第几块被吃掉了」的地方**。
+        #    两个使用点（`get_audio_callback` 和 `StreamingAudioFeat` 的 pull）
+        #    都走它，漏掉任何一个账本就从此错位。
+        def _pull_and_register():
+            chunk = self.inbox.pull_block()
+            if self._ledger is not None and chunk is not None:
+                self._ledger.on_block_pulled(chunk)
+            return chunk
+
+        self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
+                                max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8))
+        pipe.get_audio_callback = _pull_and_register
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。
         #    上游 `_streaming_encode_next_audio_block_or_random` 把每一块
@@ -298,7 +328,7 @@ class LiveAvatarPipelineSource:
             return emb[..., :block_frames].contiguous()
 
         self._feat = StreamingAudioFeat(
-            pipe.audio_encoder, pull=self.inbox.pull_block,
+            pipe.audio_encoder, pull=_pull_and_register,
             block_samples=self.geometry.block_samples, fps=self.geometry.fps,
             device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
         pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
@@ -311,10 +341,31 @@ class LiveAvatarPipelineSource:
                     continue             # DiT rank 只 yield None，不出帧
                 for img in self._to_rgba(item):
                     self._probe(img)
+                    if self._ledger is not None:
+                        self._ledger.on_frame(img)     # 观察态：只记账，不改发布
+                        self._ledger_report()
                     self._offer(img)
         except Exception:
             # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
             log.exception("生成中断，这一路退化成只出声")
+
+    def _ledger_report(self) -> None:
+        """定期把账本状态吼一声。**观察态不出声就等于没接。**
+
+        报的是「这一块的帧对上没有」，**不是「发了几秒」** —— 后者正是
+        现有那个一路绿灯的监控在数的东西，它永远是绿的（见 docs/lip-sync.md）。
+        """
+        led = self._ledger
+        if led is None or led.frames_seen % 250:
+            return
+        s = led.stats()
+        bad = (not s["reconciled"]) or s["errors"]
+        (log.warning if bad else log.info)(
+            "账本[观察态] 块 %d｜帧 见%d 预热%d 拒收%d 丢%d｜在途%d 待发%d"
+            "｜错%d｜对账%s",
+            s["blocks_pulled"], s["frames_seen"], s["frames_prewarm"],
+            s["frames_rejected"], s["frames_dropped"], s["pending_blocks"],
+            s["ready_blocks"], s["errors"], "平" if s["reconciled"] else "**不平**")
 
     def _probe(self, img: np.ndarray) -> None:
         """量一下**发出去的像素本身**，别只量「有没有帧」。
