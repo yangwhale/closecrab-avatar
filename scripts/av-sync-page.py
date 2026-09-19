@@ -223,27 +223,35 @@ const v=document.getElementById('v'), a=document.getElementById('a');
 const slider=document.getElementById('off'), val=document.getElementById('val');
 const hint=document.getElementById('hint'), playBtn=document.getElementById('play');
 const cv=document.getElementById('wave'), ctx=cv.getContext('2d');
+const astate=document.getElementById('astate');
 let cur = 0;
 
+const store = {
+  get(tag){ const x = localStorage.getItem(KEY+':'+tag); return x===null?null:+x; },
+  set(tag,o){ localStorage.setItem(KEY+':'+tag, String(o)); },
+};
+function clip(){ return CLIPS[cur]; }
+function offset(){ const o = store.get(clip().tag); return o===null?0:o; }
+function targetAudioTime(){ return v.currentTime - offset()/1000; }
+
 /* ── 声音走 WebAudio，不走 <audio> 元素 ────────────────────────────
-   两个理由，第二个是被 Chris 2026-09-19「你忘了放音轨了吧？没有声」
-   逼出来的：
+   Chris 2026-09-19：「你忘了放音轨了吧？我播放视频的时候没有声。」
+   音轨在、文件也是好的 —— 是 `<audio>` 元素在他那边没起来，而上一版
+   把 `a.play()` 的失败 `.catch(()=>{})` 吞了，**连报都不报**。
 
-   1. **`<audio>` 元素在各家 webview 里太不可靠。** 飞书/微信内置浏览器、
-      iOS 上的静音开关、第二个媒体元素拿不到播放许可 —— 任何一条中招都
-      表现为「视频在动、没有声音」，而我上一版把 `a.play()` 的失败
-      `.catch(()=>{})` 吞掉了，**连报都不报**。
-   2. 拖偏移要的是**采样级**定位，`audio.currentTime = x` 是粗的。
+   `<audio>` 在各家 webview 里太不可靠：飞书/微信内置浏览器、iOS 静音
+   开关、第二个媒体元素拿不到播放许可 —— 任何一条中招都长成「视频在动、
+   没有声音」。WebAudio 顺带还给了采样级定位，而这一页量的就是毫秒。
 
-   解不开就退回 <audio>，而且**把失败写在页面上**，不再静默。
+   解不开就退回 `<audio>`，但**把原因写在页面上**。失败要么别发生，
+   要么看得见，不能两头落空。
 ------------------------------------------------------------------ */
 let actx=null, abuf=null, asrc=null, aT0=0, vT0=0, useEl=false;
-const astate = document.getElementById('astate');
-function say(t, bad){ astate.textContent = '声音：'+t; astate.style.color = bad ? 'var(--warn)' : 'var(--mute)'; }
+function say(t, bad){ astate.textContent='声音：'+t; astate.style.color = bad?'var(--warn)':'var(--mute)'; }
 
 async function ensureAudio(){
-  const c = clip();
   if (useEl) return;
+  const c = clip();
   try {
     if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
     if (actx.state !== 'running') await actx.resume();
@@ -254,28 +262,22 @@ async function ensureAudio(){
     abuf._slug = c.slug;
     say('已就绪（WebAudio）');
   } catch (e) {
-    useEl = true;                       // 退回 <audio>，但**说出来**
-    say('WebAudio 起不来（'+e.message+'），已退回 <audio> 元素', true);
+    useEl = true;
+    say('WebAudio 起不来（'+e.message+'），退回 <audio> 元素', true);
   }
 }
-
-function stopSrc(){ if (asrc){ try{asrc.stop();}catch(_){} asrc=null; } }
-
+function stopSrc(){ if (asrc){ try{asrc.stop();}catch(_){ } asrc=null; } }
 function startSrc(){
   if (useEl || !abuf) return;
   stopSrc();
   const at = targetAudioTime();
-  if (at < 0 || at >= abuf.duration) return;   // 偏移把音频推到片外了
+  if (at < 0 || at >= abuf.duration) { say('偏移把音频推到片外了'); return; }
   asrc = actx.createBufferSource();
-  asrc.buffer = abuf; asrc.connect(actx.destination);
-  asrc.start(0, at);
+  asrc.buffer = abuf; asrc.connect(actx.destination); asrc.start(0, at);
   aT0 = actx.currentTime - at; vT0 = v.currentTime - at;
   say('播放中（WebAudio）');
 }
-
-function targetAudioTime(){ return v.currentTime - offset()/1000; }
-
-// 兜底那条路才需要逐帧对表；WebAudio 自己走自己的时钟，只做漂移纠正。
+// ⚠️ 视频是时钟。反过来在 seek 时会打架 —— video 的 seek 是关键帧对齐的。
 function syncAudio(force){
   if (useEl){
     const t = targetAudioTime();
@@ -287,8 +289,76 @@ function syncAudio(force){
   }
   if (!asrc || v.paused) return;
   const drift = (actx.currentTime - aT0) - (v.currentTime - vT0);
-  if (Math.abs(drift) > 0.05) startSrc();     // 漂了就重新对一次
+  if (Math.abs(drift) > 0.05) startSrc();
 }
+
+function renderChips(){
+  document.getElementById('chips').innerHTML = CLIPS.map((c,i)=>{
+    const o = store.get(c.tag);
+    const mark = o===null ? '' : ' <span class="done">'+(o>0?'+':'')+o+'</span>';
+    return '<button class="chip'+(i===cur?' on':'')+'" data-i="'+i+'">'+c.tag+mark+'</button>';
+  }).join('');
+  document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>select(+b.dataset.i));
+}
+
+function select(i){
+  cur = i; const c = clip();
+  v.pause(); a.pause(); stopSrc(); playBtn.textContent='播放';
+  abuf = null;                                  // 换样本就得重新解码
+  v.src = c.slug+'.mp4'; a.src = c.slug+'.m4a';
+  document.getElementById('note').textContent =
+    c.note+' ｜ '+c.sample_rate+' Hz ｜ 视频 '+c.video_seconds.toFixed(2)+
+    ' s ｜ 音频 '+c.audio_seconds.toFixed(2)+' s ｜ '+c.width+'×'+c.height+' @ '+c.fps+' fps';
+  document.getElementById('fms').textContent = (1000/c.fps).toFixed(0);
+  say('还没开始（点播放）');
+  slider.value = offset(); applyOffset(false);
+  renderChips(); renderTable();
+}
+
+function applyOffset(save){
+  const o = +slider.value;
+  val.textContent = (o>0?'+':'')+o;
+  hint.textContent = o===0 ? '音频与视频同步'
+    : o>0 ? '声音比画面晚 '+o+' ms' : '声音比画面早 '+(-o)+' ms';
+  if (save){ store.set(clip().tag, o); renderChips(); renderTable(); }
+  if (!v.paused && !useEl) startSrc(); else syncAudio(true);
+}
+
+async function toggle(){
+  if (v.paused){
+    await ensureAudio();        // ⚠️ resume 必须在用户手势里，否则 iOS 不放行
+    v.play(); playBtn.textContent='暂停';
+    if (useEl) a.play().then(()=>say('播放中（<audio>）'))
+                       .catch(e=>say('播不出来：'+e.message, true));
+    else startSrc();
+  } else {
+    v.pause(); a.pause(); stopSrc(); playBtn.textContent='播放'; say('已暂停');
+  }
+}
+
+function step(n){
+  v.pause(); a.pause(); stopSrc(); playBtn.textContent='播放';
+  v.currentTime = Math.max(0, v.currentTime + n*(1/clip().fps));
+  setTimeout(()=>syncAudio(true), 30);
+}
+
+function drawWave(){
+  const c = clip(), w = cv.clientWidth, h = cv.height, dpr = devicePixelRatio||1;
+  cv.width = w*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#dbe4f3';
+  const n = c.env.length;
+  for (let i=0;i<n;i++){
+    const x = i/n*w, bh = Math.max(1, c.env[i]*(h-22));
+    ctx.fillRect(x, h-18-bh, Math.max(1, w/n), bh);
+  }
+  const x = Math.max(0, Math.min(1, targetAudioTime()/(c.audio_seconds||1)))*w;
+  ctx.fillStyle='#b3261e'; ctx.fillRect(x-1, 0, 2, h-14);
+  ctx.fillStyle='#5f6368'; ctx.font='11px system-ui';
+  ctx.fillText('音频包络（红线 = 此刻听到的位置）', 4, h-3);
+  requestAnimationFrame(drawWave);
+}
+
 function renderTable(){
   const head = '<tr><th>样本</th><th>变量</th><th class="num">采样率</th>'
              + '<th class="num">时长 s</th><th class="num">你量到的偏移</th></tr>';
@@ -303,17 +373,36 @@ function renderTable(){
 
   const got = CLIPS.map(c=>({c, o:store.get(c.tag)})).filter(x=>x.o!==null);
   const p = document.getElementById('pattern');
-  if (got.length < 2){ p.textContent = '把两条以上拖齐之后，这里会给出初步判断。'; return; }
+  if (got.length < 2){ p.textContent='把两条以上拖齐之后，这里会给出初步判断。'; return; }
   const vals = got.map(x=>x.o), spread = Math.max(...vals)-Math.min(...vals);
   const mean = Math.round(vals.reduce((s,x)=>s+x,0)/vals.length);
   let t = '已量 '+got.length+'/'+CLIPS.length+' 条：均值 '+mean+' ms，极差 '+spread+' ms。';
+  // 直接写 <b>，不要在这儿摆一个 markdown 小解析器 —— 那个正则里的反斜杠
+  // 在 Python 模板字符串里还要再转一层，两层转义栈起来必出事（已出过）。
   t += spread <= 40
-    ? ' 各条基本一致 ⇒ 像是**固定延迟**，去查对齐点差了几帧，不是比例问题。'
+    ? ' 各条基本一致 ⇒ 像是<b>固定延迟</b>，去查对齐点差了几帧，不是比例问题。'
     : ' 各条差得多 ⇒ 不是单一常数，看看是随时长涨（比例误差）还是只有某个采样率不一样。';
-  p.innerHTML = t.replace(/\\*\\*(.+?)\\*\\*/g, '<b>$1</b>');
+  p.innerHTML = t;
 }
 
-renderChips(); select(0);
+slider.addEventListener('input', ()=>applyOffset(true));
+document.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{
+  slider.value = Math.max(-800, Math.min(800, +slider.value + (+b.dataset.d)));
+  applyOffset(true);
+});
+document.querySelectorAll('[data-f]').forEach(b=>b.onclick=()=>step(+b.dataset.f));
+document.getElementById('zero').onclick=()=>{ slider.value=0; applyOffset(true); };
+document.getElementById('back').onclick=()=>{ v.currentTime=0; syncAudio(true); };
+playBtn.onclick=toggle;
+v.addEventListener('pause', ()=>{ a.pause(); stopSrc(); playBtn.textContent='播放'; });
+addEventListener('keydown', e=>{
+  if(e.key==='ArrowLeft'){ step(-1); e.preventDefault(); }
+  if(e.key==='ArrowRight'){ step(1); e.preventDefault(); }
+  if(e.key===' '){ toggle(); e.preventDefault(); }
+});
+(function loop(){ if(!v.paused) syncAudio(false); requestAnimationFrame(loop); })();
+
+renderChips(); select(0); drawWave();
 </script>
 </html>
 """
@@ -339,11 +428,24 @@ def main() -> int:
         print(f"── {tag}  {note}")
         clips.append(build_clip(tag, note, pathlib.Path(d), out, a.prefix))
 
+    html = (HTML.replace("__TITLE__", a.title)
+                .replace("__PREFIX__", a.prefix)
+                .replace("__CLIPS__", json.dumps(clips, ensure_ascii=False)))
+    # ⚠️ **生成完必须自检。** 2026-09-19 我用一串 str.replace 给这段 JS 打补丁，
+    #    其中几处没匹配上 —— Python 的 replace **匹配不到就静默返回原串**，
+    #    于是九个函数被前一步连带删掉、后面的补丁又全部落空，发出去是一个
+    #    只剩标题的白页。Chris：「你是不是把页面改坏了？」
+    #    模板这种东西没有编译器兜着，那道防线只能自己加。
+    need = ["function clip(", "function offset(", "function renderChips(",
+            "function select(", "function applyOffset(", "async function toggle(",
+            "function step(", "function drawWave(", "function renderTable(",
+            "const store", "renderChips(); select(0); drawWave();"]
+    missing = [n for n in need if n not in html]
+    if missing:
+        raise SystemExit("✗ 生成的页面缺了这些，八成是模板被改坏了：\n  "
+                         + "\n  ".join(missing))
     (out / f"{a.prefix}.html").write_text(
-        HTML.replace("__TITLE__", a.title)
-            .replace("__PREFIX__", a.prefix)
-            .replace("__CLIPS__", json.dumps(clips, ensure_ascii=False)),
-        encoding="utf-8")
+        html, encoding="utf-8")
     total = sum(f.stat().st_size for f in out.iterdir())
     print(f"✅ {out}/{a.prefix}.html  （共 {total/1e6:.1f} MB，{len(clips)} 条）")
     return 0
