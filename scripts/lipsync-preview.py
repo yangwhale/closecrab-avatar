@@ -97,6 +97,25 @@ def audio_envelope(apcm: pathlib.Path, rate: int, ch: int, n: int) -> np.ndarray
                      for i in range(n)], dtype=float)
 
 
+def speech_onset(apcm: pathlib.Path, rate: int, ch: int) -> float:
+    """音频第一次出声的时刻（秒）。
+
+    这一步**是可靠的** —— 纯能量判据，没有模型、没有互相关。跟「滞后」
+    正相反：滞后到今天为止三种量法互相打架（起始法在短句上直接失效，
+    长句上跟互相关差 700 ms），所以滞后改成由调用方给定，不在这儿猜。
+    """
+    a = np.frombuffer(apcm.read_bytes(), np.int16)
+    if ch > 1:
+        a = a[::ch]
+    hop = rate // 50                                   # 20 ms 一格
+    pk = np.array([np.abs(a[i:i + hop]).max() for i in range(0, len(a) - hop, hop)],
+                  dtype=float)
+    if pk.max() <= 0:
+        return 0.0
+    i = int(np.argmax(pk > pk.max() * 0.08))
+    return max(0.0, i * hop / rate - 0.06)             # 留 60 ms，别把首辅音削掉
+
+
 def measure_lag(openness: np.ndarray, env: np.ndarray, fps: int) -> tuple[float, float]:
     """互相关求「画面比声音晚多少」。返回（秒, 该处相关）。"""
     z = lambda x: (x - x.mean()) / (x.std() + 1e-9)          # noqa: E731
@@ -154,9 +173,14 @@ def build(c: dict, lag: float, out: pathlib.Path) -> dict:
     w, h, fps, rate, ch, m = c["w"], c["h"], c["fps"], c["rate"], c["ch"], c["meta"]
     vraw, apcm = d / "video.rgba", d / "audio.pcm"
 
+    # ⭐ 开头一律切到**第一次出声**那一刻 —— Chris 2026-09-19：
+    #    「前导音频是不是有空白帧？都去掉吧，上来就说话才对嘛。」
+    #    探针垫的静音 + TTS 自带的那点起始静音，一起切掉，不再用固定的
+    #    `leadin` 猜 —— 那个只涵盖前者。
+    head = speech_onset(apcm, rate, ch)
     # 掐头的量必须同时落在整帧和整采样上，否则自己造一个亚帧偏移出来。
-    v_skip = int(round((lag + leadin) * fps))
-    a_skip = int(round(leadin * rate))
+    v_skip = max(0, int(round((head + lag) * fps)))
+    a_skip = max(0, int(round(head * rate)))
     v_off, a_off = v_skip * w * h * 4, a_skip * ch * 2
 
     vf = open(vraw, "rb"); vf.seek(v_off)
@@ -237,6 +261,8 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--prefix", required=True)
     ap.add_argument("--title", default="数字人口型预览")
+    ap.add_argument("--lag-ms", type=float,
+                    help="直接给定补偿毫秒数（给了就不自动量 —— 自动量目前不可靠）")
     a = ap.parse_args()
 
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True)
@@ -252,17 +278,26 @@ def main() -> int:
               + ("  ⚠️ 偏低，改用可信条目的中位数" if mm["weak"] else ""))
         measured.append(mm)
 
-    good = [m["lag"] for m in measured if not m["weak"]]
-    if not good:
-        raise SystemExit("✗ 没有一条量得可信 —— 先去 -box.jpg 看取样框是不是框错了")
-    fallback = float(np.median(good))
+    if a.lag_ms is not None:
+        # ⚠️ 自动量目前**不可信**：同一批素材上互相关给 1800/1720/1880，
+        #    起始法给 −2340/1700/1180，两者在同一条上能差 700 ms。
+        #    人眼的定性判断（「嘴快了大概半秒」）反而比它们稳，所以给了
+        #    `--lag-ms` 就一律听它的，别让一个量不准的自动值假装是测量结果。
+        fallback = a.lag_ms / 1000.0
+        print(f"   用给定的补偿 {a.lag_ms:.0f} ms（不采信自动量到的值）")
+    else:
+        good = [m["lag"] for m in measured if not m["weak"]]
+        if not good:
+            raise SystemExit("✗ 没有一条量得可信 —— 先看 -box.jpg 取样框框对没有")
+        fallback = float(np.median(good))
 
     cards = []
     for mm in measured:
-        lag = fallback if mm["weak"] else mm["lag"]
+        lag = fallback if (a.lag_ms is not None or mm["weak"]) else mm["lag"]
         c = build(mm, lag, out)
-        flag = (f"　⚠️ 这条相关只有 {c['corr']}，量不准，用的是另外两条的中位数 "
-                f"{fallback*1000:.0f} ms" if mm["weak"] else "")
+        flag = ("" if a.lag_ms is not None else
+                (f"　⚠️ 这条相关只有 {c['corr']}，量不准，用的是另外两条的中位数 "
+                 f"{fallback*1000:.0f} ms" if mm["weak"] else ""))
         print(f"── {c['tag']}  补偿 {lag*1000:.0f} ms")
         cards.append(CLIP
                      .replace("__TAG__", c["tag"]).replace("__NOTE__", c["note"])
