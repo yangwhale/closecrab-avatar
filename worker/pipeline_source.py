@@ -126,7 +126,7 @@ class LiveAvatarPipelineSource:
         直接切过去就是把一个静默的错位换成另一个静默的错位。"""
         self._frame_seq = 0
         self._real_dropped = 0
-        self._pair_dir = None
+        self._pair_root = (os.environ.get("CCA_PAIRED_DUMP") or "").strip() or None
         self._pair_a = self._pair_v = None
         self._pair_n = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
@@ -328,20 +328,6 @@ class LiveAvatarPipelineSource:
 
         self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
                                 max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8))
-        root = (os.environ.get("CCA_PAIRED_DUMP") or "").strip()
-        if root:
-            import time as _t
-            d = pathlib.Path(root) / _t.strftime("%H%M%S")
-            d.mkdir(parents=True, exist_ok=True)
-            self._pair_dir = d
-            self._pair_a = open(d / "paired.pcm", "wb")
-            self._pair_v = open(d / "paired.rgba", "wb")
-            (d / "meta.json").write_text(json.dumps({
-                "width": self.size[0], "height": self.size[1],
-                "fps": self.geometry.fps, "sample_rate": self.geometry.sample_rate,
-                "channels": 1, "frames_per_block": self.geometry.frames_per_block,
-            }, ensure_ascii=False, indent=1), encoding="utf-8")
-            log.info("⭐ 配对落盘开着 → %s（同步是构造出来的，不是量出来的）", d)
         pipe.get_audio_callback = _mk_pull("cb")
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。
@@ -408,8 +394,16 @@ class LiveAvatarPipelineSource:
 
         开关：`CCA_PAIRED_DUMP=<目录>`。默认不开。
         """
-        if self._pair_dir is None:
+        # ⚠️ **五个 rank 都会跑到这儿，但只有一个真出帧。**
+        #    第一版在创建账本时就把文件打开了 —— 于是五个 rank 各开一次
+        #    同一个路径（目录名精确到秒，必然撞），后开的把先开的截断，
+        #    写出来的东西互相打架：音频 206 块、视频却只有 103 块的量。
+        #    改成**第一帧真要写的时候才开**：不出帧的 rank 永远走不到这里。
+        if self._pair_root is None:
             return
+        if self._pair_a is None:
+            if not self._open_pair_files():
+                return
         try:
             pcm = unit.pcm
             self._pair_a.write(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
@@ -418,7 +412,27 @@ class LiveAvatarPipelineSource:
             self._pair_n += 1
         except Exception:                            # noqa: BLE001
             log.warning("配对落盘失败，本场停止", exc_info=True)
-            self._pair_dir = None
+            self._pair_root = None
+
+    def _open_pair_files(self) -> bool:
+        """真要写第一帧了才开文件。目录名带 PID，**多个 rank 也不会撞**。"""
+        import time as _t
+        try:
+            d = pathlib.Path(self._pair_root) / f"{_t.strftime('%H%M%S')}-{os.getpid()}"
+            d.mkdir(parents=True, exist_ok=True)
+            self._pair_a = open(d / "paired.pcm", "wb")
+            self._pair_v = open(d / "paired.rgba", "wb")
+            (d / "meta.json").write_text(json.dumps({
+                "width": self.size[0], "height": self.size[1],
+                "fps": self.geometry.fps, "sample_rate": self.geometry.sample_rate,
+                "channels": 1, "frames_per_block": self.geometry.frames_per_block,
+            }, ensure_ascii=False, indent=1), encoding="utf-8")
+            log.info("⭐ 配对落盘 → %s（同步是构造出来的，不是量出来的）", d)
+            return True
+        except Exception:                            # noqa: BLE001
+            log.warning("配对落盘开不起来", exc_info=True)
+            self._pair_root = None
+            return False
 
     def _ledger_report(self) -> None:
         """定期把账本状态吼一声。**观察态不出声就等于没接。**
