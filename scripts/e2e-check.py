@@ -272,38 +272,46 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
     t_joined = time.monotonic()
     print(f"数字人已进房（{t_joined - t_created:.1f} s）")
 
-    # ⚠️ **进房 ≠ 能收音频。** `AvatarRunner.start()` 的顺序是
-    #    先 `audio_recv.start()`（挂上 `lk.audio_stream` 的回调）、
-    #    **再**发布音视频轨。进房那一刻这两件事都还没做。
+    # ⚠️ **进房 ≠ 能收音频**，但「等视频轨」这个判据是个死锁，别再写回来。
     #
-    #    这中间是几秒的窗口（要加载形象、reset 模型）。往里推音频的话，
-    #    LiveKit 只在 worker 日志里留一句
-    #    `ignoring byte stream with topic 'lk.audio_stream', no callback attached`
-    #    —— 不报错、不重试、这一段音频**直接丢掉**。脚本这头看到的是
-    #    「一帧都没收到」，跟「模型没跑起来」长得一模一样，会把人带去查模型。
+    # 真实约束：`AvatarRunner.start()` 先 `audio_recv.start()`（挂上
+    # `lk.audio_stream` 回调）、**再**发布音视频轨。进房那一刻两件事都没做，
+    # 这中间要加载形象、reset 模型。往里推音频的话 LiveKit 只在 worker 日志
+    # 留一句 `ignoring byte stream ... no callback attached` —— 不报错、
+    # 不重试，这一段**直接丢掉**。
     #
-    #    所以等**视频轨发布**再推：那一步在 `audio_recv.start()` 之后，
-    #    看见它就等于接收端已经就位。用发布事件而不是 sleep —— 形象大小、
-    #    机器忙闲都会改变这段时间，猜一个秒数迟早会在别的机器上翻车。
-    async def _avatar_video_published() -> bool:
-        p = agent_room.remote_participants.get(avatar_identity)
-        return bool(p) and any(
-            pub.kind == rtc.TrackKind.KIND_VIDEO
-            for pub in p.track_publications.values())
-
-    deadline = time.monotonic() + a.join_timeout
-    while not await _avatar_video_published():
-        if time.monotonic() > deadline:
-            print(f"❌ 数字人进房了但 {a.join_timeout}s 内没发布视频轨 —— "
-                  f"`runner.start()` 卡住了，看 worker 日志")
-            return 1
-        await asyncio.sleep(0.2)
-    print(f"数字人已发布视频轨（再 {time.monotonic() - t_joined:.1f} s），开始推音频")
+    # 所以这里原来等「数字人发布了视频轨」再推。那在 `_lazy_publish=False`
+    # 的年代是对的，现在**必然超时**：
+    #
+    #     发视频轨 ← 要第一帧 ← 要音频 ← 我在等视频轨
+    #     └──────────────── 转圈 ────────────────┘
+    #
+    # `AvatarRunner.__init__` 的默认值 `_lazy_publish=True`（官方注释：
+    # publish tracks **until the first frame pushed**）。2026-09-19 实测：
+    # 探针每次都停在「60s 内没发布视频轨」，而 worker 日志里连
+    # 「第一帧音频到了」都没有 —— 因为一个字节都没推出去。
+    # 同一个坑 CloseCrab 侧刚踩过一遍，判据换成「人进房了」才解开。
+    #
+    # 换成**静音前导**：接收端没挂上之前丢掉的是静音，损失为零；
+    # 真音频从 `t_audio0` 起算，首帧延迟照样准。比猜一个 sleep 秒数稳，
+    # 因为它不依赖「多久能就位」这个会随机器和形象变的量。
+    LEADIN_S = 2.0
+    print(f"开始推音频（前面垫 {LEADIN_S:.0f} s 静音，等接收端挂上）")
 
     # 4. 推音频。按实时速率推 —— **一次性灌进去量不出真实延迟**。
     out = DataStreamAudioOutput(agent_room, destination_identity=avatar_identity,
                                 sample_rate=SAMPLE_RATE)
     chunk = SAMPLE_RATE // 10                     # 100 ms 一包
+
+    # 静音前导。**不能用 sleep 代替** —— 要的就是「真的在推」，
+    # 这样接收端一挂上就立刻开始收，不用再等下一个时间点。
+    quiet = np.zeros(chunk, dtype=np.int16)
+    for _ in range(int(LEADIN_S * 10)):
+        await out.capture_frame(rtc.AudioFrame(
+            data=quiet.tobytes(), sample_rate=SAMPLE_RATE,
+            num_channels=1, samples_per_channel=chunk))
+        await asyncio.sleep(0.1)
+
     t_audio0 = time.monotonic()
     for i in range(0, len(pcm), chunk):
         part = pcm[i:i + chunk]
