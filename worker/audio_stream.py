@@ -167,7 +167,8 @@ class PcmInbox:
             self._draining = True
             self._cv.notify_all()
 
-    def pull_utterance(self, max_s: float = 15.0) -> np.ndarray:
+    def pull_utterance(self, max_s: float = 15.0,
+                       timeout: float | None = None) -> np.ndarray | None:
         """**等一整句话到齐，一次性全给。** 返回这句话的全部 PCM（float32）。
 
         ## 为什么要有这个
@@ -194,11 +195,27 @@ class PcmInbox:
 
         万一上游一直不发段落结束（比如 TTS 流没收尾），攒到 `max_s` 就先翻
         已有的这一截，**并打日志**。不设的话一次异常能让数字人永远不开口。
+
+        ## `timeout` 是防死锁的
+
+        给了 `timeout` 而这段时间里没等到整句，返回 `None`（区别于「关了」
+        的空数组）。调用方拿到 `None` 要立刻喂一块静音特征继续转 ——
+        理由见下面那段注释，不是可选项。
         """
         cap = int(max_s * self._geom.sample_rate)
         with self._cv:
-            self._cv.wait_for(
-                lambda: self._closed or self._draining or self._pending >= cap)
+            ready = self._cv.wait_for(
+                lambda: self._closed or self._draining or self._pending >= cap,
+                timeout)
+            if not ready:
+                # ⚠️ **超时必须返回 None，不能继续等。** 调用方跑在 VAE rank 上，
+                #    它每转一圈要给四个 DiT rank 发一块音频特征。它在这儿停住，
+                #    那四个就永远堵在 dist.recv —— 五张卡一起死。
+                #    2026-09-19 实测过一次：py-spy 打出来正好是这个形状。
+                #
+                #    「等音频」在旧实现里**同时还是整条流水线的节拍器**。改成
+                #    整句缓存之后节拍器没了，这个超时就是补回来的那一下。
+                return None
             if self._closed:
                 return np.zeros(0, dtype=np.float32)
             hit_cap = not self._draining and self._pending >= cap

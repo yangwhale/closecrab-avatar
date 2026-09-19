@@ -345,6 +345,8 @@ class UtteranceAudioFeat:
         self._fallback = fallback
         self._max_s = (_float_env("CCA_UTTERANCE_MAX_S", 15.0)
                        if max_utterance_s is None else float(max_utterance_s))
+        self._idle_timeout = _float_env("CCA_FEAT_IDLE_TIMEOUT_S", 0.2)
+        """没等到下一句就先喂静音、继续转圈的等待上限。**不是调优旋钮，是防死锁。**"""
         self._z = None          # 这句话的全部特征 [T, L, D]
         self._cursor = 0
         self._lock = threading.Lock()
@@ -381,10 +383,20 @@ class UtteranceAudioFeat:
                 self._z, self._cursor = None, 0
 
         if self._z is None or self._cursor >= self._z.shape[0]:
-            pcm = np.asarray(self._pull_utt(self._max_s), dtype=np.float32).reshape(-1)
+            # ⚠️ **带超时地要，不许干等。** 这个函数跑在 VAE rank 上，它每转
+            #    一圈要给四个 DiT rank 发一块。停在这儿 ＝ 五张卡一起死锁。
+            #    2026-09-19 第一版就是干等的，py-spy 打出来：VAE rank 停在
+            #    pull_utterance，四个 DiT rank 停在 dist.recv。
+            #
+            #    旧的逐块实现之所以没这个毛病，是因为「等够 0.48 s 音频」
+            #    这件事**顺带当了整条流水线的节拍器**。换成整句缓存之后
+            #    那个节拍器没了，得自己补一个。
+            got = self._pull_utt(self._max_s, self._idle_timeout)
+            if got is None:
+                return self._silence(block_frames, torch)   # 没人说话，嘴闭着
+            pcm = np.asarray(got, dtype=np.float32).reshape(-1)
             if pcm.size == 0:
-                # 关了 / 没东西。给一块静音的特征，别让五张卡卡住。
-                return self._silence(block_frames, torch)
+                return self._silence(block_frames, torch)   # 会话关了
             self._z = self._encode_utterance(pcm, block_frames, torch)
             self._cursor = 0
             log.info("整句编码完成：%.2f s 音频 → %d 帧特征（%d 块）",

@@ -157,3 +157,55 @@ def test_empty_utterance_does_not_hang_or_throw():
     out = f.next_block(12)
     assert out.shape == (1, 25, 1024, 12)
     assert float(out.abs().sum()) == 0.0
+
+
+# ── 防死锁：没下一句时必须继续转 ──────────────────────────────────
+
+def test_pull_utterance_returns_none_on_timeout():
+    """没等到整句要返回 None，跟「关了」的空数组区分开。"""
+    box = PcmInbox(G)
+    box.push(_pcm(0.5))                 # 有音频但没收到段落结束
+    assert box.pull_utterance(max_s=30, timeout=0.15) is None
+    assert box.pending_samples > 0, "超时不该把攒着的音频吃掉"
+
+
+def test_feat_emits_silence_instead_of_blocking():
+    """⚠️ **这条拦的是五卡死锁。**
+
+    这个函数跑在 VAE rank 上，每转一圈要给四个 DiT rank 发一块。它一旦
+    干等，那四个就永远堵在 dist.recv。2026-09-19 实测过，py-spy 打出来
+    正好是这个形状。所以「没音频」时必须吐一块静音继续转。
+    """
+    enc = FakeEnc()
+    f = UtteranceAudioFeat(enc, pull_utterance=lambda *_: None,
+                           fps=G.fps, sample_rate=G.sample_rate)
+    out = f.next_block(12)
+    assert out.shape == (1, 25, 1024, 12)
+    assert float(out.abs().sum()) == 0.0, "静音块应该是全零 —— 嘴闭着"
+
+
+def test_pull_is_called_with_a_timeout():
+    """**必须带超时地要。** 不带超时就是上面那个死锁。"""
+    seen = []
+
+    def pull(max_s, timeout=None):
+        seen.append(timeout)
+        return None
+
+    f = UtteranceAudioFeat(FakeEnc(), pull_utterance=pull,
+                           fps=G.fps, sample_rate=G.sample_rate)
+    f.next_block(12)
+    assert seen and seen[0] is not None and seen[0] > 0, \
+        f"pull 的 timeout 是 {seen}，不带超时 VAE rank 会把五张卡一起拖死"
+
+
+def test_recovers_when_the_next_utterance_finally_arrives():
+    """先静音顶几圈，音频来了要能接上，而且从第 0 帧开始。"""
+    q = [None, None, np.zeros(G.sample_rate * 2, dtype=np.float32)]
+    enc = FakeEnc()
+    f = UtteranceAudioFeat(enc, pull_utterance=lambda *_: (q.pop(0) if q else None),
+                           fps=G.fps, sample_rate=G.sample_rate)
+    assert float(f.next_block(12).abs().sum()) == 0.0
+    assert float(f.next_block(12).abs().sum()) == 0.0
+    out = f.next_block(12)
+    assert out[0, 0, 0].tolist() == [float(v) for v in range(12)], "接上之后没从头开始"
