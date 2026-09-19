@@ -59,13 +59,14 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def envelope(pcm: pathlib.Path, *, rate: int, channels: int, points: int) -> list[float]:
+def envelope(pcm: pathlib.Path, *, rate: int, channels: int, points: int,
+             skip_bytes: int = 0) -> list[float]:
     """把 PCM 压成一条 0..1 的响度包络。
 
     用**每段绝对值的最大值**而不是 RMS：判断「嘴该不该张」看的是有没有
     冲击，RMS 会把清辅音那种短促高频抹平，而那恰恰是口型最明显的时刻。
     """
-    raw = pcm.read_bytes()
+    raw = pcm.read_bytes()[skip_bytes:]
     n = len(raw) // 2
     if n == 0:
         return []
@@ -86,8 +87,20 @@ def envelope(pcm: pathlib.Path, *, rate: int, channels: int, points: int) -> lis
     return out
 
 
+def _trimmed(path: pathlib.Path, skip_bytes: int):
+    """从 `skip_bytes` 处开始把文件喂给 ffmpeg 的 stdin。
+
+    **不用 ffmpeg 的 `-ss`** —— 裸流没有时间信息，`-ss` 只能按码率估位置，
+    而这一页量的就是毫秒，估出来的头等于把待测量本身搞脏。按字节切是精确的：
+    调用方保证 `skip_bytes` 落在整帧 / 整采样的边界上。
+    """
+    f = open(path, "rb")
+    f.seek(skip_bytes)
+    return f
+
+
 def build_clip(tag: str, note: str, d: pathlib.Path, out: pathlib.Path,
-               prefix: str) -> dict:
+               prefix: str, trim_head: float = 0.0) -> dict:
     meta_p = d / "meta.json"
     if not meta_p.exists():
         raise SystemExit(f"✗ 没有 {meta_p} —— 这一场没正常收尾，参数不可信")
@@ -95,27 +108,51 @@ def build_clip(tag: str, note: str, d: pathlib.Path, out: pathlib.Path,
     w, h, fps = m["width"], m["height"], m["fps"]
     rate, ch = m["sample_rate"], m["channels"]
     apcm = d / "audio.pcm"
+    vraw = d / "video.rgba"
     slug = f"{prefix}-{tag}"
 
+    # ⭐ 掐头：**两条流必须掐掉完全相同的时长**，否则就是自己造一个偏移出来。
+    #
+    #    探针为了等接收端挂上，会在真音频前面垫几秒静音（`--leadin`）。
+    #    那几秒原样进了录制：开头一段静音 + 一张不动的脸。
+    #    Chris 2026-09-19：「视频老是先播半秒一秒才出声，感觉视频被拉长了，
+    #    多出来的部分放到音频前面。」—— 那就是这段前导，不是管线的毛病。
+    #    但它让判口型变难（要先干等），所以做成页面之前掐掉。
+    #
+    #    帧数和采样数都取整：25 fps 与 16k/48k 下，0.1 s 的整数倍一定同时落在
+    #    整帧和整采样上。不取整的话两条流会差出零点几帧 —— 而那正是被测量。
+    nv_skip = int(round(trim_head * fps))
+    na_skip = int(round(trim_head * rate))
+    v_off, a_off = nv_skip * w * h * 4, na_skip * ch * 2
+    real_trim = nv_skip / fps
+    if abs(real_trim - na_skip / rate) > 1e-9:
+        raise SystemExit(f"✗ {tag}: 掐头 {trim_head}s 在 {fps}fps/{rate}Hz 下对不齐")
+
     # 视频**不带声音**：偏移要在浏览器里调，焊在一个文件里就没得调了。
-    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", str(fps),
-         "-i", str(d / "video.rgba"), "-an",
-         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out / f"{slug}.mp4")])
-    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "s16le", "-ar", str(rate), "-ac", str(ch), "-i", str(apcm),
-         "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
-         str(out / f"{slug}.m4a")])
+    with _trimmed(vraw, v_off) as vf:
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
+                        "-r", str(fps), "-i", "pipe:0", "-an",
+                        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        str(out / f"{slug}.mp4")], stdin=vf, check=True)
+    with _trimmed(apcm, a_off) as af:
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "s16le", "-ar", str(rate), "-ac", str(ch),
+                        "-i", "pipe:0", "-c:a", "aac", "-b:a", "160k",
+                        "-movflags", "+faststart",
+                        str(out / f"{slug}.m4a")], stdin=af, check=True)
 
     return {
         "tag": tag, "note": note, "slug": slug, "session": d.name,
         "width": w, "height": h, "fps": fps,
         "sample_rate": rate, "channels": ch,
-        "video_frames": m["video_frames"],
-        "video_seconds": round(m["video_frames"] / fps, 3),
-        "audio_seconds": round(apcm.stat().st_size / (rate * ch * 2), 3),
-        "env": envelope(apcm, rate=rate, channels=ch, points=ENVELOPE_POINTS),
+        "video_frames": m["video_frames"] - nv_skip,
+        "video_seconds": round((m["video_frames"] - nv_skip) / fps, 3),
+        "audio_seconds": round((apcm.stat().st_size - a_off) / (rate * ch * 2), 3),
+        "trim_head": round(real_trim, 3),
+        "env": envelope(apcm, rate=rate, channels=ch,
+                        points=ENVELOPE_POINTS, skip_bytes=a_off),
     }
 
 
@@ -411,22 +448,31 @@ renderChips(); select(0); drawWave();
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", action="append", required=True,
-                    help='「短名|变量说明|录制目录」，可重复')
+                    help='「短名|变量说明|录制目录[|掐头秒数]」，可重复')
     ap.add_argument("--out", required=True)
     ap.add_argument("--prefix", required=True, help="产物文件名前缀，保证同目录不打架")
     ap.add_argument("--title", default="数字人音画同步检查")
+    ap.add_argument("--trim-head", type=float, default=0.0,
+                    help="音视频各掐掉开头这么多秒（去掉探针垫的静音前导）")
     a = ap.parse_args()
 
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     clips = []
     for spec in a.clip:
-        parts = spec.split("|")
-        if len(parts) != 3:
-            raise SystemExit(f"✗ --clip 要三段「短名|说明|目录」，收到：{spec}")
-        tag, note, d = (p.strip() for p in parts)
-        print(f"── {tag}  {note}")
-        clips.append(build_clip(tag, note, pathlib.Path(d), out, a.prefix))
+        parts = [x.strip() for x in spec.split("|")]
+        if len(parts) not in (3, 4):
+            raise SystemExit(
+                f"✗ --clip 要「短名|说明|目录」，可选第四段是这一条单独的掐头秒数，"
+                f"收到：{spec}")
+        tag, note, d = parts[0], parts[1], parts[2]
+        # 每条的静音前导长度可能不一样（探针的 --leadin 是按条给的），
+        # 所以掐头也得按条给；不给就用全局那个。
+        trim = float(parts[3]) if len(parts) == 4 else a.trim_head
+        print(f"── {tag}  {note}"
+              + (f"（掐头 {trim:g}s）" if trim else ""))
+        clips.append(build_clip(tag, note, pathlib.Path(d), out, a.prefix,
+                                trim_head=trim))
 
     html = (HTML.replace("__TITLE__", a.title)
                 .replace("__PREFIX__", a.prefix)
