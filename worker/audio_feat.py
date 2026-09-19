@@ -156,6 +156,18 @@ def block_indices(window_samples: int, block_samples: int, block_frames: int,
             for i in range(block_frames)]
 
 
+def _float_env(name: str, default: float) -> float:
+    """浮点旋钮。读不出来就用默认值，绝不抛 —— 一个手滑的值不该让会话起不来。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r 不是数，用默认值 %s", name, raw, default)
+        return default
+
+
 def _lookback_seconds() -> float:
     raw = (os.environ.get("CCA_AUDIO_LOOKBACK_S") or "").strip()
     try:
@@ -302,3 +314,112 @@ class StreamingAudioFeat:
         return linear_interpolation(feat.float(), input_fps=W2V_FPS,
                                     output_fps=self._video_rate,
                                     output_len=self._out_len)
+
+
+class UtteranceAudioFeat:
+    """**整句到齐再编码**，然后按块切片喂给模型。
+
+    跟 `StreamingAudioFeat` 的区别只有一句话：那个是「边来边翻」，
+    这个是「听完整句再翻」。为什么要换，见 `PcmInbox.pull_utterance`
+    的那张余弦表 —— 一句话概括：因果编码的天花板是 0.81，够不着。
+
+    编码这一步**原封不动用上游离线那两步**：
+
+        extract_audio_feat_from_array(...)  →  get_audio_embed_bucket_fps(...)
+
+    ⚠️ **不要在这里重新实现帧映射。** 我们上一版自己算了窗口和索引
+    （`choose_window` / `block_indices`），每一处都有理有据，加起来还是
+    对不上 —— 因为对不对不是推出来的，是那两个函数定义的。既然离线那条
+    已经被确认 100% 对，就照抄它的调用，不要照抄它的道理。
+    """
+
+    def __init__(self, audio_encoder, *, pull_utterance, fps: int,
+                 device=None, dtype=None, sample_rate: int = 16000,
+                 max_utterance_s: float | None = None, fallback=None):
+        self._enc = audio_encoder
+        self._pull_utt = pull_utterance
+        self._fps = int(fps)
+        self._sr = int(sample_rate)
+        self._device = device
+        self._dtype = dtype
+        self._fallback = fallback
+        self._max_s = (_float_env("CCA_UTTERANCE_MAX_S", 15.0)
+                       if max_utterance_s is None else float(max_utterance_s))
+        self._z = None          # 这句话的全部特征 [T, L, D]
+        self._cursor = 0
+        self._lock = threading.Lock()
+        self._pending_reset = False
+        log.info("音频特征：**整句编码**模式（上限 %.1f s）—— "
+                 "开口前要等这句音频到齐，换特征跟离线一致", self._max_s)
+
+    def reset(self) -> None:
+        """被打断：这句话作废。理由同 `StreamingAudioFeat.reset` —— 只置标志。"""
+        with self._lock:
+            self._pending_reset = True
+
+    def next_block(self, block_frames: int):
+        """⚠️ **绝不能让异常跑出这个函数。**
+
+        它跑在 VAE rank 上，算完要 `dist.send` 给四个 DiT rank。抛出去的话
+        那四个永远堵在 `dist.recv`，五张卡一起死。
+        """
+        try:
+            return self._next(block_frames)
+        except Exception:                                # noqa: BLE001
+            log.warning("整句编码失败，这一块回退上游老实现（口型会差一截）",
+                        exc_info=True)
+            if self._fallback is None:
+                raise
+            return self._fallback(np.zeros(0, dtype=np.float32), block_frames)
+
+    def _next(self, block_frames: int):
+        import torch
+
+        with self._lock:
+            if self._pending_reset:
+                self._pending_reset = False
+                self._z, self._cursor = None, 0
+
+        if self._z is None or self._cursor >= self._z.shape[0]:
+            pcm = np.asarray(self._pull_utt(self._max_s), dtype=np.float32).reshape(-1)
+            if pcm.size == 0:
+                # 关了 / 没东西。给一块静音的特征，别让五张卡卡住。
+                return self._silence(block_frames, torch)
+            self._z = self._encode_utterance(pcm, block_frames, torch)
+            self._cursor = 0
+            log.info("整句编码完成：%.2f s 音频 → %d 帧特征（%d 块）",
+                     pcm.size / self._sr, self._z.shape[0],
+                     -(-self._z.shape[0] // block_frames))
+
+        lo = self._cursor
+        hi = min(lo + block_frames, self._z.shape[0])
+        blk = self._z[lo:hi]
+        self._cursor = hi
+        if blk.shape[0] < block_frames:
+            # 句尾不足一块：拿最后一帧补齐。补零会让嘴**突然闭死**，
+            # 补最后一帧只是多定格一两帧，看起来自然得多。
+            pad = blk[-1:].repeat(block_frames - blk.shape[0], 1, 1)
+            blk = torch.cat([blk, pad], dim=0)
+
+        # [n, L, D] → [L, D, n] → [1, L, D, n]，上游硬契约（audio_template）
+        return blk.permute(1, 2, 0).unsqueeze(0).to(
+            self._device, self._dtype).contiguous()
+
+    def _encode_utterance(self, pcm: np.ndarray, block_frames: int, torch):
+        """整段跑一次 —— **调的就是离线那两个函数**。"""
+        enc = self._enc
+        z = enc.extract_audio_feat_from_array(
+            pcm, sample_rate=self._sr, return_all_layers=True, dtype=torch.float32)
+        eb, _ = enc.get_audio_embed_bucket_fps(
+            z, fps=self._fps, batch_frames=block_frames,
+            m=getattr(enc, "audio_sample_m", 0))
+        return eb.float()                                  # [T, L, D]
+
+    def _silence(self, block_frames: int, torch):
+        if self._z is not None and self._z.shape[0]:
+            d = self._z.shape[1:]
+        else:
+            d = (25, 1024)
+        blk = torch.zeros((block_frames, *d), dtype=torch.float32)
+        return blk.permute(1, 2, 0).unsqueeze(0).to(
+            self._device, self._dtype).contiguous()

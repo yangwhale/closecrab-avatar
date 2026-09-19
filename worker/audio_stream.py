@@ -167,6 +167,51 @@ class PcmInbox:
             self._draining = True
             self._cv.notify_all()
 
+    def pull_utterance(self, max_s: float = 15.0) -> np.ndarray:
+        """**等一整句话到齐，一次性全给。** 返回这句话的全部 PCM（float32）。
+
+        ## 为什么要有这个
+
+        模型不直接听声音，中间隔着一步「把声音翻译成每一帧嘴该怎么动」。
+        这一步用的是 wav2vec，**它带全局自注意力** —— 同一个音，放在整句话
+        里翻和单拎出半秒翻，结果不一样。
+
+        实测（2026-09-19，拿离线整段编码当标尺，因为那条已确认口型 100% 对）：
+
+            逐块 0.48 s 单独编码（上游原版）      余弦 0.49
+            滑动窗口回看 3.84 s（我们之前那版）   余弦 0.70
+            回看 3.84 s ＋预看 0.96 s             余弦 0.80
+            **从头到现在的整段前缀＋预看**        余弦 0.81  ← 因果做法的天花板
+
+        天花板只有 0.81，说明**只要坚持「边来边翻」，就永远追不平离线**。
+        差 0.2 足够让嘴型完全对不上（Chris 实测：官方离线严丝合缝，我们这条
+        「一点也没对上」）。
+
+        所以换判据：不追因果，改成**等这句说完再翻**。代价是开口前多等一个
+        TTS 生成整句的时间（几百毫秒），换来的是特征跟离线**一模一样**。
+
+        ## `max_s` 是防挂死的，不是调优旋钮
+
+        万一上游一直不发段落结束（比如 TTS 流没收尾），攒到 `max_s` 就先翻
+        已有的这一截，**并打日志**。不设的话一次异常能让数字人永远不开口。
+        """
+        cap = int(max_s * self._geom.sample_rate)
+        with self._cv:
+            self._cv.wait_for(
+                lambda: self._closed or self._draining or self._pending >= cap)
+            if self._closed:
+                return np.zeros(0, dtype=np.float32)
+            hit_cap = not self._draining and self._pending >= cap
+            out = (np.concatenate(self._buf) if self._buf
+                   else np.zeros(0, dtype=np.int16))
+            self._buf.clear()
+            self._pending = 0
+            self._draining = False
+        if hit_cap:
+            log.warning("攒到 %.1f s 还没收到段落结束，先按这一截翻 —— "
+                        "上游可能没发 AudioSegmentEnd", max_s)
+        return out.astype(np.float32) / 32768.0
+
     def clear(self) -> None:
         """打断。**把没念的全扔了。**
 

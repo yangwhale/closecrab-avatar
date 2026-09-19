@@ -66,7 +66,7 @@ import threading
 
 import numpy as np
 
-from .audio_feat import StreamingAudioFeat
+from .audio_feat import StreamingAudioFeat, UtteranceAudioFeat
 from .audio_stream import BlockGeometry, PcmInbox
 
 log = logging.getLogger("closecrab.avatar.pipeline")
@@ -348,14 +348,27 @@ class LiveAvatarPipelineSource:
         #    没有这个开关的话，只能靠读代码猜 —— 而这一段的对错**不可能
         #    靠读代码判断**，它是个实测问题（见 `block_indices` 的注释：
         #    物理上更准的做法实测反而更差）。
-        if (os.environ.get("CCA_AUDIO_FEAT") or "").strip().lower() == "upstream":
-            log.warning("⚠️ CCA_AUDIO_FEAT=upstream：音频编码走**上游原版**逐块编码，"
-                        "我们那条滑窗版不装。这是对照用的，不是常态。")
+        # 三种音频编码，`CCA_AUDIO_FEAT` 选：
+        #   utterance（默认）整句到齐再编码 —— 跟离线一致，见 UtteranceAudioFeat
+        #   sliding        边来边翻的滑动窗口 —— 我们的旧版，天花板 0.81
+        #   upstream       上游原版逐块编码 —— 对照用，0.49
+        # 留着后两个不是为了将来可能用，是因为**这三条的优劣只能实测**，
+        # 没有开关就只能靠读代码猜，而这件事已经猜错过两轮。
+        mode = (os.environ.get("CCA_AUDIO_FEAT") or "utterance").strip().lower()
+        if mode == "upstream":
+            log.warning("⚠️ CCA_AUDIO_FEAT=upstream：走上游原版逐块编码。对照用，不是常态。")
             self._feat = None
-        else:
+        elif mode == "sliding":
+            log.warning("⚠️ CCA_AUDIO_FEAT=sliding：走旧的滑动窗口。对照用，不是常态。")
             self._feat = StreamingAudioFeat(
                 pipe.audio_encoder, pull=self.inbox.pull_block,
                 block_samples=self.geometry.block_samples, fps=self.geometry.fps,
+                device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
+            pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
+        else:
+            self._feat = UtteranceAudioFeat(
+                pipe.audio_encoder, pull_utterance=self.inbox.pull_utterance,
+                fps=self.geometry.fps, sample_rate=self.geometry.sample_rate,
                 device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
             pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
 
