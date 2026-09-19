@@ -305,6 +305,46 @@ def test_lead_blocks_zero_is_the_old_behaviour():
     assert [u.pcm for u in drain(led)] == ["pcm0", "pcm1"]
 
 
+def test_drain_resets_correspondence_without_knowing_depth():
+    """⭐⭐ 抽干之后，下一块的帧必定是它自己的 —— **不用知道流水线多深**。
+
+    > Chris 2026-09-19：「你把音频怼进去然后等着，不管等多久，
+    > 出来的第一帧准是你自己的帧。」
+
+    这比 lead_blocks 好在：猜深度要求「我猜对了」，抽干只要求「我等到了」。
+    **把一个假设变成了可强制的状态。**
+    """
+    led = AVLedger(frames_per_block=FPB, lead_blocks=3)   # 故意给个错的深度
+    led.on_block_pulled("old")
+    for i in range(7):
+        led.on_frame(f"stale{i}")
+    led.on_pipeline_drained()                              # 管线空了
+
+    led.on_block_pulled("new")
+    for i in range(FPB):
+        led.on_frame(f"f{i}")
+    u = led.pop_ready()
+    assert u is not None and u.pcm == "new", "抽干后第一块没配上"
+    assert u.frames == [f"f{i}" for i in range(FPB)], \
+        f"抽干后仍然配到旧帧：{u.frames[:3]}"
+    assert led.drains == 1
+    assert led.reconciled
+
+
+def test_drain_discards_in_flight_old_frames():
+    """抽干时在途的属于上一段，留着会被算进下一块。"""
+    led = AVLedger(frames_per_block=FPB)
+    led.on_block_pulled("a")
+    for i in range(FPB - 4):
+        led.on_frame(f"old{i}")
+    led.on_pipeline_drained()
+    assert led.pop_ready() is None
+    feed(led, 1)
+    u = led.pop_ready()
+    assert u is not None and all("old" not in str(f) for f in u.frames)
+    assert led.reconciled
+
+
 # ── 对账 ──────────────────────────────────────────────────────────
 
 def test_every_frame_is_accounted_for_in_a_messy_run():

@@ -116,6 +116,7 @@ class AVLedger:
         self.blocks_dropped = 0
         self.frames_published = 0
         self.errors = 0
+        self.drains = 0
 
     # ── 进 ────────────────────────────────────────────────────────
 
@@ -212,6 +213,29 @@ class AVLedger:
         self._pending.clear()
         self._ready.clear()
 
+    def on_pipeline_drained(self) -> None:
+        """管线抽干了 —— **对应关系在这一刻归零。**
+
+        模型回头来要下一块而我们没货，说明它已经把在途的全吐完了。
+        这是唯一一个不用猜流水线深度就能确定对应关系的时刻。
+
+        > Chris 2026-09-19：「你把音频怼进去然后等着，不管等多久，
+        > 出来的第一帧准是你自己的帧。」
+
+        比 `lead_blocks` 那条路好在：**它把一个假设变成了可强制的状态**。
+        猜深度要求「我猜对了」，抽干只要求「我等到了」。
+
+        在途的必须扔 —— 那些帧属于上一段，留着会被算进下一块。
+        """
+        n = len(self._pending) + len(self._ready)
+        if n:
+            for u in list(self._pending) + list(self._ready):
+                self.frames_dropped += len(u.frames)
+                self.blocks_dropped += 1
+            self._pending.clear(); self._ready.clear()
+        self._lead_left = 0          # 抽干之后不需要再吃预热
+        self.drains += 1
+
     def on_generator_restart(self, why: str = "换形象") -> None:
         """上游生成器从头开始了（**换形象是唯一会触发的情形**）。
 
@@ -265,6 +289,7 @@ class AVLedger:
             "pending_blocks": len(self._pending),
             "ready_blocks": len(self._ready),
             "errors": self.errors,
+            "drains": self.drains,
             "reconciled": self.reconciled,
         }
 

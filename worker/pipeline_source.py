@@ -326,9 +326,30 @@ class LiveAvatarPipelineSource:
                 return chunk
             return _pull
 
+        def _on_drained():
+            """管线空了：**账本归零、出帧队列清空。**
+
+            这一刻之后出来的第一帧，必定属于下一块音频 —— 不用序号、
+            也不用知道流水线多深（`lead_blocks` 那个猜测因此可以退休）。
+
+            ⚠️ 队列也要清：里面若还剩旧帧，它们会被当成新音频的帧发出去，
+            **配对就从第一帧起错开**。两边一起清，缺一不可。
+            """
+            n = 0
+            while True:
+                try:
+                    self._frames.get_nowait(); n += 1
+                except queue.Empty:
+                    break
+            if self._ledger is not None:
+                self._ledger.on_pipeline_drained()
+            if n:
+                log.info("管线抽干：清掉出帧队列里剩的 %d 帧，配对基准归零", n)
+
+        self.inbox.on_drained = _on_drained
         self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
                                 max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8),
-                                lead_blocks=_int_env("CCA_LEAD_BLOCKS", 4))
+                                lead_blocks=_int_env("CCA_LEAD_BLOCKS", 0))
         pipe.get_audio_callback = _mk_pull("cb")
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。

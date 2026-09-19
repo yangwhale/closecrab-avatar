@@ -22,10 +22,13 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 
 import numpy as np
+
+log = logging.getLogger("closecrab.avatar.audio")
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,11 @@ class PcmInbox:
         self._cv = threading.Condition()
         self._draining = False      # 句子说完了，剩下这点尾巴也要放行
         self._closed = False
+        self.on_drained = None
+        """管线抽干时回调一次（在 `pull_block` 真要阻塞之前）。
+
+        **这是整条链上唯一一个能免费拿到「对应关系归零」的地方** ——
+        不需要序号、不需要知道流水线多深。"""
 
     # ── 事件循环那一侧 ──────────────────────────────────────────────
 
@@ -209,6 +217,20 @@ class PcmInbox:
         need = self._geom.block_samples
         out = np.zeros(need, dtype=np.float32)
         with self._cv:
+            if not self._ready() and self.on_drained is not None:
+                # ⭐ **管线空了的那一刻，就是这里。**
+                #    模型回头来要下一块、而我们没货 —— 说明它已经把在途的
+                #    全吐出来了。这是唯一一个「不用猜流水线多深」就能确定
+                #    对应关系的时刻：从下一块起，出来的帧必定是那一块的。
+                #
+                #    > Chris 2026-09-19：「你把音频怼进去然后等着，不管等
+                #    > 多久，出来的第一帧准是你自己的帧。」
+                #
+                #    回调在持锁状态下调用，**里面别再回头碰 inbox**，会死锁。
+                try:
+                    self.on_drained()
+                except Exception:                       # noqa: BLE001
+                    log.warning("on_drained 回调出错，忽略", exc_info=True)
             self._cv.wait_for(self._ready, timeout)
 
             filled = 0
