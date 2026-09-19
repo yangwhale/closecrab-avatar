@@ -69,7 +69,17 @@ def measure(dump: pathlib.Path, leadin: float, marks: dict[str, float]) -> dict:
         # 连续 3 帧超过基线 5σ 才算「嘴动了」—— 单帧会被压缩噪声骗到
         on = next((i for i in range(f0, min(len(op) - 3, f0 + int(fps * 4)))
                    if (dev[i:i + 3] > noise * 5).all()), None)
-        out[tag] = None if on is None else round((on / fps - a_on) * 1000)
+        # ⚠️ **开口前嘴本来就在动的话，这个读数不作数。**
+        #    「音频起点之后第一次嘴动」这个判据有个致命前提：开口前嘴是静的。
+        #    多句片子里下一句开始时，上一句积压的帧还在播，嘴一直在动 ——
+        #    判据立刻触发，报出一个漂亮的 0，而真实偏移可能是 1.8 秒。
+        #    2026-09-19 就是这么误判成「稳态是对齐的」的：所有接近 0 的读数
+        #    无一例外都出自这种情况，而我拿它们当了结论。
+        #    **一个只在特定前提下成立的判据，必须自己检查那个前提。**
+        pre = dev[max(0, f0 - int(fps * 0.4)):f0]
+        noisy = bool(len(pre)) and bool((pre > noise * 5).mean() > 0.3)
+        lag = None if on is None else round((on / fps - a_on) * 1000)
+        out[tag] = {"ms": lag, "trust": not noisy}
     return {"lags": out, "frames": m["video_frames"], "fps": fps,
             "video_s": round(m["video_frames"] / fps, 2),
             "audio_s": round((dump / "audio.pcm").stat().st_size
@@ -130,7 +140,7 @@ h2{font-size:17px;margin:0 0 2px}
       border-radius:999px;padding:1px 8px;margin-left:6px}
 .meta{color:var(--mute);font-size:13px;margin:0 0 6px}
 .lags{font-size:14px;margin:0 0 10px;font-variant-numeric:tabular-nums}
-.lags b{font-weight:600}.big{color:var(--warn)}.small{color:var(--ok)}
+.lags b{font-weight:600}.mute{color:var(--mute);font-size:12px}.big{color:var(--warn)}.small{color:var(--ok)}
 video{width:100%;max-height:70vh;background:#000;border-radius:8px;display:block}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th,td{padding:6px;border-bottom:1px solid var(--line);text-align:left}
@@ -146,6 +156,8 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <div class="card"><div class="verdict">
 <b>怎么读。</b>每句下面那个数是「音频第一次出声 → 嘴第一次动」，
 正数表示嘴慢、负数表示嘴快。一帧 = 40 ms，所以<b>绝对值小于 40 就是对齐的</b>。<br>
+<b>划掉的读数不作数</b>：那一句开口时嘴本来就在动（上一句积压的帧还在播），
+判据会立刻误触发报出一个漂亮的 0。<b>只看没划掉的。</b><br>
 同一形状的两遍放在一起看：<b>两遍差得多，就说明这个偏移不是固定值</b> ——
 那正是不能用一个常数去补偿的理由。
 </div></div>
@@ -154,13 +166,18 @@ __CARDS__
 </div></html>"""
 
 
-def fmt_lags(lags: dict[str, int | None]) -> str:
+def fmt_lags(lags: dict) -> str:
+    """不可信的读数**标出来，不当数据用** —— 好看的假数字比没数字危险。"""
     if not lags:
         return '<span class="mute">没量到</span>'
     bits = []
-    for k, v in lags.items():
+    for k, r in lags.items():
+        v, trust = r["ms"], r["trust"]
         if v is None:
             bits.append(f"{k} <b>?</b>")
+        elif not trust:
+            bits.append(f'{k} <s class="mute">{v:+d} ms</s>'
+                        f'<span class="mute">（开口前嘴就在动，不作数）</span>')
         else:
             cls = "small" if abs(v) < 40 else "big"
             bits.append(f'{k} <b class="{cls}">{v:+d} ms</b>')
