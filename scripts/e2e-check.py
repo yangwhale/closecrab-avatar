@@ -43,19 +43,29 @@ from livekit.agents.voice.avatar import DataStreamAudioOutput    # noqa: E402
 from closecrab_avatar.auth import sign_client_token              # noqa: E402
 
 SAMPLE_RATE = 16000
+"""推流采样率。**启动时按输入 wav 改写**（见 `_read_wav_mono`）。
+
+不写死的理由是它本身就是个被怀疑对象：线上 CloseCrab 推 48 kHz，
+这个脚本原来只推 16 kHz —— 拿 16 k 量出来的口型偏移不能直接安到线上，
+两者中间隔着一次重采样。要比就得能两边都推。"""
+
+_ALLOWED_RATES = (16000, 24000, 48000)
 
 
-def _read_wav_16k_mono(path: str) -> np.ndarray:
-    """读成 16 kHz 单声道 int16。**不做重采样** —— 不对就直接报错。
+def _read_wav_mono(path: str) -> np.ndarray:
+    """读单声道 int16，**采样率以文件为准**。**不做重采样** —— 不对就报错。
 
     悄悄重采样会让「口型对不上」这种问题多一个嫌疑人；宁可让调用方先转好。
     """
+    global SAMPLE_RATE
     with wave.open(path, "rb") as w:
-        if w.getframerate() != SAMPLE_RATE or w.getnchannels() != 1 or w.getsampwidth() != 2:
+        rate = w.getframerate()
+        if rate not in _ALLOWED_RATES or w.getnchannels() != 1 or w.getsampwidth() != 2:
             raise SystemExit(
-                f"{path} 是 {w.getframerate()} Hz / {w.getnchannels()} 声道 / "
-                f"{w.getsampwidth() * 8} bit，需要 16000 Hz 单声道 16 bit。\n"
-                f"  ffmpeg -i {path} -ar 16000 -ac 1 -c:a pcm_s16le 转好的.wav")
+                f"{path} 是 {rate} Hz / {w.getnchannels()} 声道 / "
+                f"{w.getsampwidth() * 8} bit，需要 {_ALLOWED_RATES} 之一、单声道 16 bit。\n"
+                f"  ffmpeg -i {path} -ar 48000 -ac 1 -c:a pcm_s16le 转好的.wav")
+        SAMPLE_RATE = rate
         return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
 
 
@@ -165,9 +175,9 @@ async def run(a) -> int:
     lk_key = os.environ["LIVEKIT_API_KEY"]
     lk_secret = os.environ["LIVEKIT_API_SECRET"]
 
-    pcm = _read_wav_16k_mono(a.audio)
+    pcm = _read_wav_mono(a.audio)          # ← 顺带把 SAMPLE_RATE 定下来
     secs = len(pcm) / SAMPLE_RATE
-    print(f"音频 {a.audio}：{secs:.1f} s / {len(pcm)} 采样")
+    print(f"音频 {a.audio}：{secs:.1f} s / {len(pcm)} 采样 @ {SAMPLE_RATE} Hz")
 
     room_name = a.room
     avatar_identity, agent_identity = "e2e-avatar", "e2e-agent"
@@ -177,10 +187,24 @@ async def run(a) -> int:
 
     # 1. 建会话 —— 控制面挑一个 worker 派过去
     headers = {"Authorization": f"Bearer {sign_client_token(key_id, secret)}"}
+    # ⚠️ **`sample_rate` 不能省。** worker 拿它建数字人自己那条音轨的
+    #    `AudioSource`（`AvatarOptions.audio_sample_rate`，缺省 16000），
+    #    而进来的音频是**原样转发**进那个 source 的。两边不一致时：
+    #
+    #      Exception: InvalidState - sample_rate and num_channels don't match
+    #
+    #    这句异常抛在 `_forward_video` 里，**整条推帧任务当场死掉** ——
+    #    模型照常在算，一帧也发不出去。表现是「进房了、音频也收到了、
+    #    就是没有画面」，跟模型崩了长得一模一样。
+    #
+    #    2026-09-19 我拿这个脚本跑 48 k / 24 k 各三次全军覆没，一度以为
+    #    「线上那条 48 kHz 的路是坏的」—— 其实 CloseCrab 老老实实发了
+    #    `sample_rate=48000`，是这个脚本没发。**探针自己造出来的故障，
+    #    差点被当成生产故障报上去。**
     body = dict(provider="liveavatar", livekit_url=a.livekit_url,
                 room_name=room_name, room_sid=f"RM_{int(secs * 1000)}",
                 avatar_identity=avatar_identity, avatar_name="E2E",
-                agent_identity=agent_identity)
+                agent_identity=agent_identity, sample_rate=SAMPLE_RATE)
     async with aiohttp.ClientSession() as http:
         async with http.post(f"{a.gateway}/avatar/sessions",
                              json=body, headers=headers) as r:
@@ -295,7 +319,7 @@ async def _drive(http, a, headers, psid, pcm, secs, out_dir) -> int:
     # 换成**静音前导**：接收端没挂上之前丢掉的是静音，损失为零；
     # 真音频从 `t_audio0` 起算，首帧延迟照样准。比猜一个 sleep 秒数稳，
     # 因为它不依赖「多久能就位」这个会随机器和形象变的量。
-    LEADIN_S = 2.0
+    LEADIN_S = a.leadin
     print(f"开始推音频（前面垫 {LEADIN_S:.0f} s 静音，等接收端挂上）")
 
     # 4. 推音频。按实时速率推 —— **一次性灌进去量不出真实延迟**。
@@ -387,7 +411,10 @@ def main() -> int:
     p.add_argument("--gateway", default=os.environ.get("LA_GATEWAY_URL",
                                                        "http://127.0.0.1:8080"))
     p.add_argument("--livekit-url", required=True)
-    p.add_argument("--audio", required=True, help="16 kHz 单声道 16 bit wav")
+    p.add_argument("--audio", required=True,
+                   help="单声道 16 bit wav，16k/24k/48k 之一（按文件里的采样率推）")
+    p.add_argument("--leadin", type=float, default=2.0,
+                   help="真音频之前垫多少秒静音，等接收端挂上（默认 2）")
     p.add_argument("--room", default=f"e2e-{os.getpid()}")
     p.add_argument("--out", help="抽帧存哪（不给就不存）")
     p.add_argument("--save-every", type=int, default=25,
