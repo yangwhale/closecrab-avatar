@@ -405,8 +405,16 @@ class LiveAvatarPipelineSource:
             if not self._open_pair_files():
                 return
         try:
-            pcm = unit.pcm
-            self._pair_a.write(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
+            # ⚠️ **`pull_block()` 返回的是 float32 [-1,1]**（它的 docstring 写着，
+            #    wav2vec 的 processor 要这个量纲）。直接 tobytes() 写出去、
+            #    再按 s16le 读，每块就变成两倍长 —— 合出来音频正好是视频的 2 倍。
+            #    我在这上面绕了两圈：先怀疑「一半音频被吃掉」（被计数证伪），
+            #    再怀疑多 rank 抢文件（确有其事，但不是这个 2 倍的原因）。
+            #    **两个真 bug 叠在同一个症状上，修掉第一个时症状没变，
+            #    很容易以为第一个没修对。**
+            pcm = np.asarray(unit.pcm, dtype=np.float32)
+            self._pair_a.write((np.clip(pcm, -1.0, 1.0) * 32767.0)
+                               .astype(np.int16).tobytes())
             for img in unit.frames:
                 self._pair_v.write(img.tobytes())
             self._pair_n += 1
