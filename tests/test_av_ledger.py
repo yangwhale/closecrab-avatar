@@ -272,6 +272,39 @@ def test_restart_keeps_block_numbers_monotonic():
     assert led.on_block_pulled("new") >= before
 
 
+def test_lead_blocks_shifts_attribution_by_whole_blocks():
+    """⭐⭐ 流水线深度：拉到第 k 块时，吐出来的是第 k−lead 块的帧。
+
+    Chris 2026-09-19 在真片子上看出来的：「声音先出来，2 秒后嘴才动。」
+    而账本当时报**对账平、零错误** —— 数量完全对得上，错的是对应关系。
+    「先进先出归属」那个前提（拉一块马上吐这一块）在流水线管线上不成立。
+
+    ⚠️ 修正量是**块数**，整数、结构性的；不是毫秒。墙上时钟会随负载漂，
+    块数不会 —— 这正是按序号配对该占的便宜。
+    """
+    led = AVLedger(frames_per_block=FPB, lead_blocks=2)
+    for i in range(2 * FPB):                  # 预热 + 在途那两块的帧
+        led.on_block_pulled(f"a{i}") if i < 2 else None
+        led.on_frame(f"stale{i}")
+    assert led.pop_ready() is None, "预热那几块的帧不该配出东西"
+    assert led.errors == 0
+    for b in range(2):
+        for i in range(FPB):
+            led.on_frame(f"f{b}.{i}")
+    u = led.pop_ready()
+    assert u is not None and u.pcm == "a0"
+    assert u.frames == [f"f0.{i}" for i in range(FPB)], \
+        f"块 a0 配到的不是它自己的帧：{u.frames[:2]}"
+    assert led.reconciled
+
+
+def test_lead_blocks_zero_is_the_old_behaviour():
+    """lead=0 时行为跟以前完全一样 —— 这个参数不能偷偷改变默认语义。"""
+    led = AVLedger(frames_per_block=FPB, lead_blocks=0)
+    feed(led, 2)
+    assert [u.pcm for u in drain(led)] == ["pcm0", "pcm1"]
+
+
 # ── 对账 ──────────────────────────────────────────────────────────
 
 def test_every_frame_is_accounted_for_in_a_messy_run():

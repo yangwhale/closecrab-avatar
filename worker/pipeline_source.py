@@ -327,7 +327,8 @@ class LiveAvatarPipelineSource:
             return _pull
 
         self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
-                                max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8))
+                                max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8),
+                                lead_blocks=_int_env("CCA_LEAD_BLOCKS", 4))
         pipe.get_audio_callback = _mk_pull("cb")
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。

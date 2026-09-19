@@ -72,11 +72,27 @@ class AVLedger:
     整个序列是原子的**，而它不是。
     """
 
-    def __init__(self, *, frames_per_block: int, max_pending_blocks: int = 6) -> None:
+    def __init__(self, *, frames_per_block: int, max_pending_blocks: int = 6,
+                 lead_blocks: int = 0) -> None:
         if frames_per_block <= 0:
             raise ValueError("frames_per_block 必须为正")
         self.fpb = frames_per_block
         self.max_pending = max(1, max_pending_blocks)
+        self.lead_blocks = max(0, lead_blocks)
+        """**流水线深度：拉到第 k 块时，正在吐的是第 k−lead 块的帧。**
+
+        「先进先出归属」有个没写下来的前提：模型拉一块、马上吐这一块的帧。
+        这条管线不满足 —— 它开头两轮用预置音频预热，那两轮的帧在我们
+        第一次拉块**之后**才出来，于是被算成第 0、1 块的；再加上在途的，
+        整体错开约 4 块。
+
+        表现是「声音先出来，2 秒后嘴才动」，而账本**照样报对账平、零错误**
+        —— 因为数量完全对得上，错的是对应关系。这正是设计文档里写的
+        「唯一的脆弱点」，而我先前只验了「一次回调恰好 12 帧」那一半。
+
+        ⚠️ 它是**块数**（整数、结构性的），不是毫秒。所以跟「量一个延迟去补」
+        不是一回事：墙上时钟会随负载漂，块数不会。"""
+        self._lead_left = self.lead_blocks * frames_per_block
 
         self._pending: deque[Unit] = deque()   # 已登记、帧还没齐
         self._ready: deque[Unit] = deque()     # 帧齐了、等着被取走
@@ -116,6 +132,11 @@ class AVLedger:
     def on_frame(self, img: Any) -> None:
         """上游吐出一帧。按**拉取顺序**归给最早那个还没填满的块。"""
         self.frames_seen += 1
+        # 开头这 lead_blocks 块的帧是预热/在途的产物，不属于我们拉的任何一块。
+        if self._lead_left > 0:
+            self._lead_left -= 1
+            self.frames_prewarm += 1
+            return
         for u in self._pending:
             if not u.full:
                 u.frames.append(img)
@@ -210,6 +231,7 @@ class AVLedger:
         n = len(self._pending) + len(self._ready)
         self.clear()
         self._awaiting_warmup = True
+        self._lead_left = self.lead_blocks * self.fpb   # 重启要重新吃一遍预热
         log.info("生成器重启（%s）：扔掉在途 %d 块，重新进入预热态", why, n)
 
     # ── 对账 ──────────────────────────────────────────────────────
