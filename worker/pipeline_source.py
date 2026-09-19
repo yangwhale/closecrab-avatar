@@ -57,8 +57,10 @@ rank 4 停在回调里，rank 0–3 自然堵在 `dist.recv`，整组一起停�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import pathlib
 import queue
 import threading
 
@@ -124,6 +126,9 @@ class LiveAvatarPipelineSource:
         直接切过去就是把一个静默的错位换成另一个静默的错位。"""
         self._frame_seq = 0
         self._real_dropped = 0
+        self._pair_dir = None
+        self._pair_a = self._pair_v = None
+        self._pair_n = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
         if self._dump_dir:
             os.makedirs(self._dump_dir, exist_ok=True)
@@ -311,6 +316,20 @@ class LiveAvatarPipelineSource:
 
         self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
                                 max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8))
+        root = (os.environ.get("CCA_PAIRED_DUMP") or "").strip()
+        if root:
+            import time as _t
+            d = pathlib.Path(root) / _t.strftime("%H%M%S")
+            d.mkdir(parents=True, exist_ok=True)
+            self._pair_dir = d
+            self._pair_a = open(d / "paired.pcm", "wb")
+            self._pair_v = open(d / "paired.rgba", "wb")
+            (d / "meta.json").write_text(json.dumps({
+                "width": self.size[0], "height": self.size[1],
+                "fps": self.geometry.fps, "sample_rate": self.geometry.sample_rate,
+                "channels": 1, "frames_per_block": self.geometry.frames_per_block,
+            }, ensure_ascii=False, indent=1), encoding="utf-8")
+            log.info("⭐ 配对落盘开着 → %s（同步是构造出来的，不是量出来的）", d)
         pipe.get_audio_callback = _pull_and_register
 
         # ⭐ 连**怎么编码**也得换掉，不只是「从哪拿音频」。
@@ -351,13 +370,43 @@ class LiveAvatarPipelineSource:
                         #    2026-09-19 我就是这么报出一个「生成的 85% 被丢掉」
                         #    的假发现的。**观察者不能改变被观察的量，包括它
                         #    自己统计出来的那个量。**
-                        while self._ledger.pop_ready() is not None:
-                            pass
+                        while (unit := self._ledger.pop_ready()) is not None:
+                            self._dump_pair(unit)
                         self._ledger_report()
                     self._offer(img)
         except Exception:
             # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
             log.exception("生成中断，这一路退化成只出声")
+
+    def _dump_pair(self, unit) -> None:      # noqa: ANN001
+        """把**配好对的一组**落盘：这一块音频，紧跟它生成的那几帧。
+
+        ⭐ 这么出来的片子，同步是**构造出来的**，不是量出来的 ——
+        写进文件的每一帧，就是写在它前面那段音频生成的。没有补偿、
+        没有偏移参数、没有「我觉得差 1750 毫秒」。
+
+        > Chris 2026-09-19：「现在是同步问题。你先把一个视频给我弄对了再说。」
+
+        所以这条路不等发布侧改完：账本在观察态就已经知道谁配谁，
+        直接把它知道的东西写出来即可。**它同时也是发布侧的验收基准** ——
+        发布侧改完之后出来的片子，应该跟这个一模一样。
+
+        音频是模型吃进去的那一份（16 kHz 单声道）。判口型足够，
+        而且它跟帧的对应关系是**定义上的**，不经过任何重采样或转发。
+
+        开关：`CCA_PAIRED_DUMP=<目录>`。默认不开。
+        """
+        if self._pair_dir is None:
+            return
+        try:
+            pcm = unit.pcm
+            self._pair_a.write(pcm.tobytes() if hasattr(pcm, "tobytes") else bytes(pcm))
+            for img in unit.frames:
+                self._pair_v.write(img.tobytes())
+            self._pair_n += 1
+        except Exception:                            # noqa: BLE001
+            log.warning("配对落盘失败，本场停止", exc_info=True)
+            self._pair_dir = None
 
     def _ledger_report(self) -> None:
         """定期把账本状态吼一声。**观察态不出声就等于没接。**
