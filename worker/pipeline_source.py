@@ -342,11 +342,22 @@ class LiveAvatarPipelineSource:
             emb, _ = pipe.encode_audio_from_array(chunk, infer_frames=block_frames)
             return emb[..., :block_frames].contiguous()
 
-        self._feat = StreamingAudioFeat(
-            pipe.audio_encoder, pull=self.inbox.pull_block,
-            block_samples=self.geometry.block_samples, fps=self.geometry.fps,
-            device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
-        pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
+        # ⭐ **可以一键换回上游那条。** `CCA_AUDIO_FEAT=upstream`
+        #    口型不准时这是最值钱的一刀：我们只换了「怎么把音频编成特征」
+        #    这一件事，换回去还不准，说明问题不在这儿，可以整块排除。
+        #    没有这个开关的话，只能靠读代码猜 —— 而这一段的对错**不可能
+        #    靠读代码判断**，它是个实测问题（见 `block_indices` 的注释：
+        #    物理上更准的做法实测反而更差）。
+        if (os.environ.get("CCA_AUDIO_FEAT") or "").strip().lower() == "upstream":
+            log.warning("⚠️ CCA_AUDIO_FEAT=upstream：音频编码走**上游原版**逐块编码，"
+                        "我们那条滑窗版不装。这是对照用的，不是常态。")
+            self._feat = None
+        else:
+            self._feat = StreamingAudioFeat(
+                pipe.audio_encoder, pull=self.inbox.pull_block,
+                block_samples=self.geometry.block_samples, fps=self.geometry.fps,
+                device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
+            pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
 
         try:
             for item in self._generate(pipe):
