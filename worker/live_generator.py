@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from typing import AsyncIterator, Protocol, Union
 
@@ -42,6 +43,19 @@ from .av_dump import AVDump
 log = logging.getLogger("closecrab.avatar.generator")
 
 AVOut = Union[rtc.VideoFrame, rtc.AudioFrame, AudioSegmentEnd]
+
+
+def _float_env(name: str, default: float) -> float:
+    """浮点旋钮。理由同 `_int_env`：手滑的值不该让会话起不来。"""
+    import os
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r 不是数，用默认值 %s", name, raw, default)
+        return default
 
 
 def _int_env(name: str, default: int) -> int:
@@ -62,7 +76,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 class FrameSource(Protocol):
-    """模型那一侧。**只有四个成员** —— 多一个都说明编排漏到模型里去了。
+    """模型那一侧。**只有五个成员** —— 多一个都说明编排漏到模型里去了。
 
     注意这里**一个 asyncio 的东西都没有**。模型跑在普通线程里，两边靠
     `PcmInbox`（带锁）和 `next_frame()`（非阻塞轮询）交接，不需要
@@ -93,6 +107,13 @@ class FrameSource(Protocol):
 
     def reset(self) -> None:
         """丢掉在途状态（含 inbox）。被打断时调。"""
+        ...
+
+    def drop_pending_frames(self, why: str) -> int:
+        """只扔已生成未发出的帧（不动 inbox），返回扔了几帧。
+
+        **一句话开始前调**，让「下一帧属于谁」这件事重新确定。
+        """
         ...
 
 
@@ -190,6 +211,17 @@ class LiveAvatarGenerator(VideoGenerator):
         self._video_out_s = 0.0        # 已吐出去的视频时长
         self._audio_out_s = 0.0        # 已吐出去的音频时长
 
+        # ── 一句话的边界 ──
+        self._utt_open = False         # 现在在一句话中间吗
+        self._utt_samples = 0          # 这句话喂进模型多少个 16 kHz 采样
+        self._utt_frames = 0           # 这句话已经发出去几帧视频
+        self._quiesce_s = _float_env("CCA_QUIESCE_TIMEOUT_S", 3.0)
+        """开一句话之前，最多等多久让管线静下来。
+
+        等到了就抽干、开推；等不到也抽干、开推 —— **超时不是错误**，
+        只是说明这次的配对基准没那么干净，日志里会写一条。
+        宁可画面错半秒，也不能把一句话卡死在这儿。"""
+
     @property
     def size(self) -> tuple[int, int]:
         return self._src.size
@@ -207,6 +239,15 @@ class LiveAvatarGenerator(VideoGenerator):
             self._audio_live = False       # 句尾那截视频不计入统计
             self._src.inbox.mark_segment_end()
             self._audio_out.append(frame)
+            self._utt_open = False
+            # ⭐ **这句话该出多少帧，是算出来的，不是看出来的。**
+            #    inbox 攒够一整块才给模型，段尾不足一块的那截由
+            #    `mark_segment_end()` 补零放行 —— 所以是向上取整。
+            blk = self._geom.block_samples
+            want = -(-self._utt_samples // blk) * self._geom.frames_per_block
+            log.info("这句话：喂进 %d 采样（%.2f s）→ 应出 %d 帧，实发 %d 帧（差 %+d）",
+                     self._utt_samples, self._utt_samples / self._geom.sample_rate,
+                     want, self._utt_frames, self._utt_frames - want)
             log.info("音频段结束：本场累计 %d 帧 / %.1f s；"
                      "音频最多领先 %.0f ms（额度 %.0f ms）、最多落后 %.0f ms",
                      self._audio_frames, self._audio_seconds,
@@ -214,8 +255,14 @@ class LiveAvatarGenerator(VideoGenerator):
                      self._max_lag * 1000)
             return
 
+        if not self._utt_open:
+            await self._begin_utterance()
+            self._utt_open = True
+
         self._audio_live = True
         self._audio_frames += 1
+        self._utt_samples += round(frame.samples_per_channel
+                                   * self._geom.sample_rate / frame.sample_rate)
         self._audio_seconds += frame.samples_per_channel / frame.sample_rate
         if self._audio_frames == 1:
             log.info("⭐ 本场第一帧音频到了：%d Hz，%d 声道 —— 音频这条路是通的",
@@ -228,6 +275,58 @@ class LiveAvatarGenerator(VideoGenerator):
         self._audio_out.append(frame)
         self._src.inbox.push(np.frombuffer(frame.data, dtype=np.int16),
                              src_rate=frame.sample_rate)
+
+    async def _begin_utterance(self) -> None:
+        """一句话要开始了：**等管线静下来，再把残留帧全部扔掉。**
+
+        > Chris 2026-09-19：「你现在要输入一个新的音频帧，在这之前你先把
+        > 视频的队列清空。这样的话从此以后再生成的视频帧，就是这个音频
+        > 触发的，这才能对得齐。甚至连编号都不用数 —— 出来的第一帧准是
+        > 你自己的帧。」
+
+        ## 残留是哪来的
+
+        不是上一句的尾巴（那截会被正常发完）。是**预热**：上游流式管线
+        第 0、1 轮用的是预置音频，产出 2×12 = 24 帧「不说话的脸」；
+        再加抖动缓冲攒的 12 帧。加起来 1.4 s 左右 —— 正是「声音出来了，
+        过一两秒嘴才动」那个偏移。
+
+        ## 为什么要先等再清
+
+        清得太早，还在算的那几帧会**落在清空之后**，照样混进新音频的帧里。
+        所以先确认三件事都静止了：输入没有没消化的 PCM、出帧队列不再增长、
+        待发的音频也放完了。三个都停 ＝ 管线真空了。
+
+        **不需要知道流水线有多深** —— 这正是这个判据比数序号好的地方。
+        """
+        fps = self._geom.fps
+        tick = 1.0 / fps
+        deadline = time.monotonic() + self._quiesce_s
+        stable, last = 0, -1
+        while time.monotonic() < deadline:
+            n = self._src.pending
+            quiet = (self._src.inbox.pending_samples == 0
+                     and not self._audio_out
+                     and n == last)
+            stable = stable + 1 if quiet else 0
+            if stable >= 3:            # 连着三拍没动静（120 ms）才算停
+                break
+            last = n
+            await asyncio.sleep(tick)
+        else:
+            log.warning("等管线静下来超时（%.1f s）：出帧队列 %d、"
+                        "未消化 PCM %d 采样、待发音频 %d 件 —— 照样抽干往下走",
+                        self._quiesce_s, self._src.pending,
+                        self._src.inbox.pending_samples, len(self._audio_out))
+
+        self._src.drop_pending_frames("新一句开始")
+        # 抖动缓冲和两条时间轴一起归零，理由同 `clear_buffer`：
+        # 不归零的话这句话**不重新攒**就开播，退回「攒够才开播」之前的毛病。
+        self._rolling = False
+        self._video_out_s = 0.0
+        self._audio_out_s = 0.0
+        self._utt_samples = 0
+        self._utt_frames = 0
 
     def clear_buffer(self) -> None:
         """被打断。**把所有在途的东西一次丢干净。**
@@ -250,6 +349,11 @@ class LiveAvatarGenerator(VideoGenerator):
         self._video_out_s = 0.0
         self._audio_out_s = 0.0
         self._max_drift = 0.0
+        # 打断 ＝ 这句话不作数了。不关掉的话下一句不会走 `_begin_utterance`，
+        # 也就不会抽干 —— 被打断那句留下的在途帧会顶到下一句头上。
+        self._utt_open = False
+        self._utt_samples = 0
+        self._utt_frames = 0
 
     def close_recording(self) -> None:
         """会话结束：把录制收尾，写出 `meta.json`。
@@ -355,6 +459,7 @@ class LiveAvatarGenerator(VideoGenerator):
 
             if (img := self._src.next_frame()) is not None:
                 self._video_out_s += frame_s
+                self._utt_frames += 1
                 vf = to_video_frame(img)
                 self._dump.video(bytes(vf.data))
                 yield vf

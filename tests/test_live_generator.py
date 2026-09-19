@@ -24,6 +24,8 @@ class FakeSource:
         self._inbox = PcmInbox(G)
         self._frames: list[np.ndarray] = []
         self.resets = 0
+        self.drops = 0          # 句首抽干了几次
+        self.dropped_frames = 0 # 一共扔了几帧
 
     @property
     def size(self):
@@ -48,6 +50,13 @@ class FakeSource:
         self.resets += 1
         self._inbox.clear()
         self._frames.clear()
+
+    def drop_pending_frames(self, why):
+        n = len(self._frames)
+        self._frames.clear()
+        self.drops += 1
+        self.dropped_frames += n
+        return n
 
     def emit(self):
         self._frames.append(np.zeros((self.h, self.w, 4), dtype=np.uint8))

@@ -165,6 +165,35 @@ class LiveAvatarPipelineSource:
         except queue.Empty:
             return None
 
+    def drop_pending_frames(self, why: str) -> int:
+        """把**已经生成、还没发出去**的帧全部扔掉，配对基准归零。
+
+        返回扔了几帧。
+
+        ## 为什么这件事必须由上层在「一句话开始」那一刻触发
+
+        ⚠️ **不要挂在「音频输入队列变空」上。** 试过，错得很彻底：
+
+        实时推流下 inbox **本来就一直在空** —— 音频按 40 ms 一小块推进来，
+        模型消费得比推得快，于是一句话中间 inbox 每秒要见底好几次。挂在
+        那个事件上等于**一边说话一边不停清自己的帧**，实测同一段音频两次
+        会话，一次收到 0 帧、一次 140 帧，差别只是推送节奏碰巧谁快一点。
+
+        「队列空了」是个**会反复发生的状态**；「一句话开始了」才是**边界**。
+        清缓冲这种破坏性动作只能挂在边界上。
+        """
+        n = 0
+        while True:
+            try:
+                self._frames.get_nowait(); n += 1
+            except queue.Empty:
+                break
+        if self._ledger is not None:
+            self._ledger.on_pipeline_drained()
+        if n:
+            log.info("抽干出帧队列（%s）：扔掉残留 %d 帧，配对基准归零", why, n)
+        return n
+
     def reset(self) -> None:
         """被打断：把没念的 PCM 和已生成的在途帧一起扔掉。
 
@@ -326,27 +355,6 @@ class LiveAvatarPipelineSource:
                 return chunk
             return _pull
 
-        def _on_drained():
-            """管线空了：**账本归零、出帧队列清空。**
-
-            这一刻之后出来的第一帧，必定属于下一块音频 —— 不用序号、
-            也不用知道流水线多深（`lead_blocks` 那个猜测因此可以退休）。
-
-            ⚠️ 队列也要清：里面若还剩旧帧，它们会被当成新音频的帧发出去，
-            **配对就从第一帧起错开**。两边一起清，缺一不可。
-            """
-            n = 0
-            while True:
-                try:
-                    self._frames.get_nowait(); n += 1
-                except queue.Empty:
-                    break
-            if self._ledger is not None:
-                self._ledger.on_pipeline_drained()
-            if n:
-                log.info("管线抽干：清掉出帧队列里剩的 %d 帧，配对基准归零", n)
-
-        self.inbox.on_drained = _on_drained
         self._ledger = AVLedger(frames_per_block=self.geometry.frames_per_block,
                                 max_pending_blocks=_int_env("CCA_LEDGER_PENDING", 8),
                                 lead_blocks=_int_env("CCA_LEAD_BLOCKS", 0))

@@ -140,12 +140,6 @@ class PcmInbox:
         self._cv = threading.Condition()
         self._draining = False      # 句子说完了，剩下这点尾巴也要放行
         self._closed = False
-        self._was_fed = False
-        self.on_drained = None
-        """管线抽干时回调一次（在 `pull_block` 真要阻塞之前）。
-
-        **这是整条链上唯一一个能免费拿到「对应关系归零」的地方** ——
-        不需要序号、不需要知道流水线多深。"""
 
     # ── 事件循环那一侧 ──────────────────────────────────────────────
 
@@ -218,26 +212,18 @@ class PcmInbox:
         need = self._geom.block_samples
         out = np.zeros(need, dtype=np.float32)
         with self._cv:
-            # ⚠️ **只在「从有货到没货」那一次跳变时报，不是每次没货都报。**
-            #    「没货」在正常运行里很常见（模型偶尔跑在音频前面）。
-            #    每次都报的话，回调里那句「清空出帧队列」会把好帧一路扔光
-            #    —— 2026-09-19 实测：连着两场一帧都发不出去。
-            #    抽干是个**边沿**，不是个状态。
-            if not self._ready() and self._was_fed and self.on_drained is not None:
-                self._was_fed = False
-                # ⭐ **管线空了的那一刻，就是这里。**
-                #    模型回头来要下一块、而我们没货 —— 说明它已经把在途的
-                #    全吐出来了。这是唯一一个「不用猜流水线多深」就能确定
-                #    对应关系的时刻：从下一块起，出来的帧必定是那一块的。
-                #
-                #    > Chris 2026-09-19：「你把音频怼进去然后等着，不管等
-                #    > 多久，出来的第一帧准是你自己的帧。」
-                #
-                #    回调在持锁状态下调用，**里面别再回头碰 inbox**，会死锁。
-                try:
-                    self.on_drained()
-                except Exception:                       # noqa: BLE001
-                    log.warning("on_drained 回调出错，忽略", exc_info=True)
+            # ⚠️ **这里不要挂「管线空了」的回调。** 试过两版（状态触发、
+            #    边沿触发），两版都是错的 —— 错在判据不在错在实现：
+            #
+            #    实时推流下 inbox **本来就一直在空**。音频按 40 ms 一小块
+            #    推进来，模型消费得比推得快，一句话中间 inbox 每秒要见底
+            #    好几次。挂在这个事件上 ＝ **边说话边清自己的帧**。
+            #    实测同一段音频跑两次：一次收到 0 帧、一次 140 帧，
+            #    差别只是推送节奏碰巧谁快一点。
+            #
+            #    「队列空了」是个会反复发生的**状态**，
+            #    「一句话开始了」才是**边界**。破坏性动作只能挂边界上，
+            #    见 `LiveAvatarPipelineSource.drop_pending_frames`。
             self._cv.wait_for(self._ready, timeout)
 
             filled = 0
@@ -249,7 +235,6 @@ class PcmInbox:
                 # 只是口型对不上。
                 out[filled:filled + take] = head[:take].astype(np.float32) / 32768.0
                 filled += take
-                self._was_fed = True
                 self._pending -= take
                 if take == len(head):
                     self._buf.pop(0)
