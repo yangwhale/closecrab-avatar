@@ -57,6 +57,7 @@ rank 4 停在回调里，rank 0–3 自然堵在 `dist.recv`，整组一起停�
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -113,6 +114,20 @@ class LiveAvatarPipelineSource:
         self._size: tuple[int, int] = (0, 0)
         self._is_vae_rank = False
         self._feat: StreamingAudioFeat | None = None
+        self._blocks: collections.deque = collections.deque()
+        """每块是真音频还是空转（`True`/`False`），**按服务顺序排队**。
+
+        为什么能只用一个先进先出队列、不用给帧编号：VAE rank 的循环是
+        「先把这一段的几块音频全 serve 出去，再解码吐这一段的帧」——
+        块和帧**同进程、同线程、严格同序**。所以第 n 块对应第 n 组
+        `frames_per_block` 帧，一个计数器就够。
+
+        ⚠️ 预热那两轮（上游用预置音频）不调我们的回调，于是队列是空的，
+        那几帧按「真」放行 —— 它们随后会被句首抽干清掉，不影响对应关系。
+        """
+        self._kind = True
+        self._kind_left = 0
+        self._idle_frames = 0
         self._frame_seq = 0
         self._real_dropped = 0
         self._dump_dir = os.environ.get("CCA_FRAME_DUMP") or None
@@ -354,16 +369,7 @@ class LiveAvatarPipelineSource:
         #   upstream       上游原版逐块编码 —— 对照用，0.49
         # 留着后两个不是为了将来可能用，是因为**这三条的优劣只能实测**，
         # 没有开关就只能靠读代码猜，而这件事已经猜错过两轮。
-        # ⚠️ **默认仍是 sliding，不是 utterance。** utterance 那条口型对得多，
-        #    但**还没完工**：没人说话时上游照样要块（不给就五卡死锁），那些
-        #    静音块生成的画面目前会照发 —— 实测 12 s 音频出 57.8 s 视频，
-        #    音频跟着空转的画面跑，等于又不同步。
-        #
-        #    缺的那一环是「这一帧是哪一块生成的」，好把静音块的帧扔掉。
-        #    那正是今天上午删掉的 av_ledger 干的事 —— 删的时候以为抽干方案
-        #    让它没用了，其实只是那会儿还没遇到「必须空转」这个约束。
-        #    **要装回来，但今晚不装。**
-        mode = (os.environ.get("CCA_AUDIO_FEAT") or "sliding").strip().lower()
+        mode = (os.environ.get("CCA_AUDIO_FEAT") or "utterance").strip().lower()
         if mode == "upstream":
             log.warning("⚠️ CCA_AUDIO_FEAT=upstream：走上游原版逐块编码。对照用，不是常态。")
             self._feat = None
@@ -378,7 +384,8 @@ class LiveAvatarPipelineSource:
             self._feat = UtteranceAudioFeat(
                 pipe.audio_encoder, pull_utterance=self.inbox.pull_utterance,
                 fps=self.geometry.fps, sample_rate=self.geometry.sample_rate,
-                device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way)
+                device=pipe.device, dtype=pipe.param_dtype, fallback=_old_way,
+                on_block=self._blocks.append)
             pipe._streaming_encode_next_audio_block_or_random = self._feat.next_block
 
         try:
@@ -389,7 +396,16 @@ class LiveAvatarPipelineSource:
                     continue             # DiT rank 只 yield None，不出帧
                 for img in self._to_rgba(item):
                     self._probe(img)
-                    self._offer(img)
+                    if self._is_real_frame():
+                        self._offer(img)
+                    else:
+                        # 空转块生成的画面：**扔掉，不许发。**
+                        # 发了的话视频会凭空变长（实测 12 s 音频出 57.8 s
+                        # 视频），而音频是按视频节奏放的，于是又不同步。
+                        self._idle_frames += 1
+                        if self._idle_frames in (1, 100) or self._idle_frames % 1000 == 0:
+                            log.info("空转帧累计扔掉 %d 张（没人说话时的画面）",
+                                     self._idle_frames)
         except Exception:
             # 模型炸了不能把整条会话带走 —— 掉回「只出声」比整路断掉好。
             log.exception("生成中断，这一路退化成只出声")
@@ -422,6 +438,14 @@ class LiveAvatarPipelineSource:
         tag = "  ⚠️ 基本全黑" if black > 0.9 else ""
         log.info("帧 #%d  均值=%.1f  标准差=%.1f  黑像素比=%.2f%s",
                  self._frame_seq, mean, float(rgb.std()), black, tag)
+
+    def _is_real_frame(self) -> bool:
+        """这一帧是真音频生成的，还是空转生成的。见 `self._blocks`。"""
+        if self._kind_left <= 0:
+            self._kind = self._blocks.popleft() if self._blocks else True
+            self._kind_left = self.geometry.frames_per_block
+        self._kind_left -= 1
+        return self._kind
 
     def _offer(self, img: np.ndarray) -> None:
         """塞一帧。满了丢**最旧**的 —— 数字人只有「现在」有意义。

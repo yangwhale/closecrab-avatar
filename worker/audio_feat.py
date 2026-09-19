@@ -335,7 +335,8 @@ class UtteranceAudioFeat:
 
     def __init__(self, audio_encoder, *, pull_utterance, fps: int,
                  device=None, dtype=None, sample_rate: int = 16000,
-                 max_utterance_s: float | None = None, fallback=None):
+                 max_utterance_s: float | None = None, fallback=None,
+                 on_block=None):
         self._enc = audio_encoder
         self._pull_utt = pull_utterance
         self._fps = int(fps)
@@ -343,6 +344,12 @@ class UtteranceAudioFeat:
         self._device = device
         self._dtype = dtype
         self._fallback = fallback
+        self._on_block = on_block
+        """`on_block(is_real: bool)` —— 每serve 一块就报一次，真音频还是空转。
+
+        下游靠这个把空转块生成的画面扔掉。**不报的话那些画面会照发** ——
+        实测 12 s 音频出 57.8 s 视频，音频跟着空转的画面跑，等于又不同步。
+        """
         self._max_s = (_float_env("CCA_UTTERANCE_MAX_S", 15.0)
                        if max_utterance_s is None else float(max_utterance_s))
         self._idle_timeout = _float_env("CCA_FEAT_IDLE_TIMEOUT_S", 0.2)
@@ -403,6 +410,7 @@ class UtteranceAudioFeat:
                      pcm.size / self._sr, self._z.shape[0],
                      -(-self._z.shape[0] // block_frames))
 
+        self._report(True)
         lo = self._cursor
         hi = min(lo + block_frames, self._z.shape[0])
         blk = self._z[lo:hi]
@@ -427,7 +435,16 @@ class UtteranceAudioFeat:
             m=getattr(enc, "audio_sample_m", 0))
         return eb.float()                                  # [T, L, D]
 
+    def _report(self, is_real: bool) -> None:
+        if self._on_block is None:
+            return
+        try:
+            self._on_block(is_real)
+        except Exception:                                # noqa: BLE001
+            log.warning("on_block 回调出错，忽略", exc_info=True)
+
     def _silence(self, block_frames: int, torch):
+        self._report(False)
         if self._z is not None and self._z.shape[0]:
             d = self._z.shape[1:]
         else:
